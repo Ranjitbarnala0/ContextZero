@@ -1084,7 +1084,7 @@ export class ConceptFamilyEngine {
      */
     private tokenizeContract(contract: string): string[] {
         return contract
-            .split(/[\s,()=>{}\[\]|:;]+/)
+            .split(/[\s,()=>{}|:;\][]+/)
             .map(t => t.trim().toLowerCase())
             .filter(t => t.length > 0);
     }

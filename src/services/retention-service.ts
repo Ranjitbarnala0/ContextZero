@@ -18,7 +18,7 @@ import { retention } from '../config';
 const log = new Logger('retention-service');
 
 // Advisory lock ID for retention operations (chosen to avoid collision with ingestion locks)
-const RETENTION_LOCK_ID = 0x5343475F5245544E; // "SCG_RETN" as int
+const RETENTION_LOCK_ID = 999999937; // prime, avoids collision with ingestion locks
 
 // ────────── Result Types ──────────
 
