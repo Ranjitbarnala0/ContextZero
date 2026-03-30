@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "contextzero": {
+      "command": "node",
+      "args": ["/home/mani/Gemini /G1/dist/mcp-bridge/index.js"],
+      "env": {
+        "DB_HOST": "localhost",
+        "DB_PORT": "5432",
+        "DB_NAME": "scg_v2",
+        "DB_USER": "mani",
+        "DB_PASSWORD": "",
+        "SCG_ALLOWED_BASE_PATHS": "/home/mani",
+        "LOG_LEVEL": "info",
+        "NODE_ENV": "development"
+      }
+    }
+  }
+}

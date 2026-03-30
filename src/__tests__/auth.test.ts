@@ -1,0 +1,225 @@
+/**
+ * Unit tests for authentication middleware.
+ */
+
+import { Request, Response, NextFunction } from 'express';
+
+// Mock environment before importing the module
+const ORIGINAL_ENV = process.env;
+
+function createMockReqRes(opts: {
+    path?: string;
+    authorization?: string;
+    xApiKey?: string;
+    ip?: string;
+}): {
+    req: Partial<Request>;
+    res: Partial<Response> & { statusCode?: number; body?: any; headers?: Record<string, string> };
+    next: jest.Mock;
+} {
+    const req: Partial<Request> = {
+        path: opts.path || '/test',
+        ip: opts.ip || '127.0.0.1',
+        socket: { remoteAddress: opts.ip || '127.0.0.1' } as any,
+        headers: {
+            ...(opts.authorization ? { authorization: opts.authorization } : {}),
+            ...(opts.xApiKey ? { 'x-api-key': opts.xApiKey } : {}),
+        } as any,
+    };
+
+    const res: Partial<Response> & { statusCode?: number; body?: any; headers?: Record<string, string> } = {
+        statusCode: undefined,
+        body: undefined,
+        headers: {},
+        status(code: number) {
+            this.statusCode = code;
+            return this as Response;
+        },
+        json(data: any) {
+            this.body = data;
+            return this as Response;
+        },
+        setHeader(key: string, value: string) {
+            this.headers![key] = value;
+            return this;
+        },
+    };
+
+    const next = jest.fn();
+    return { req, res, next };
+}
+
+describe('Auth Middleware', () => {
+    beforeEach(() => {
+        jest.resetModules();
+        jest.useRealTimers();
+        process.env = { ...ORIGINAL_ENV };
+    });
+
+    afterAll(() => {
+        process.env = ORIGINAL_ENV;
+    });
+
+    test('rejects all requests when no API keys configured', async () => {
+        process.env['SCG_API_KEYS'] = '';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({});
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(res.statusCode).toBe(503);
+        expect(next).not.toHaveBeenCalled();
+    });
+
+    test('allows health check without auth', async () => {
+        process.env['SCG_API_KEYS'] = '';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({ path: '/health' });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(next).toHaveBeenCalled();
+    });
+
+    test('allows ready check without auth', async () => {
+        process.env['SCG_API_KEYS'] = '';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({ path: '/ready' });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(next).toHaveBeenCalled();
+    });
+
+    test('requires auth for metrics endpoint', async () => {
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({ path: '/metrics' });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(res.statusCode).toBe(401);
+        expect(next).not.toHaveBeenCalled();
+    });
+
+    test('exports request authentication helper for valid keys', async () => {
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { isRequestAuthenticated } = await import('../middleware/auth');
+        const { req } = createMockReqRes({
+            path: '/health',
+            authorization: 'Bearer correct-key',
+        });
+
+        expect(isRequestAuthenticated(req as Request)).toBe(true);
+    });
+
+    test('request authentication helper rejects invalid keys', async () => {
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { isRequestAuthenticated } = await import('../middleware/auth');
+        const { req } = createMockReqRes({
+            path: '/health',
+            authorization: 'Bearer wrong-key',
+        });
+
+        expect(isRequestAuthenticated(req as Request)).toBe(false);
+    });
+
+    test('accepts valid Bearer token', async () => {
+        process.env['SCG_API_KEYS'] = 'my-secret-key';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({
+            authorization: 'Bearer my-secret-key',
+        });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(next).toHaveBeenCalled();
+    });
+
+    test('accepts valid X-API-Key header', async () => {
+        process.env['SCG_API_KEYS'] = 'my-secret-key';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({
+            xApiKey: 'my-secret-key',
+        });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(next).toHaveBeenCalled();
+    });
+
+    test('rejects invalid key with 403', async () => {
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({
+            authorization: 'Bearer wrong-key',
+        });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(res.statusCode).toBe(403);
+        expect(next).not.toHaveBeenCalled();
+    });
+
+    test('rejects missing key with 401', async () => {
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({});
+        req.correlationId = 'req-123';
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(res.statusCode).toBe(401);
+        expect(res.body).toEqual(expect.objectContaining({ correlationId: 'req-123' }));
+        expect(next).not.toHaveBeenCalled();
+    });
+
+    test('supports multiple comma-separated keys', async () => {
+        process.env['SCG_API_KEYS'] = 'key-1,key-2,key-3';
+        const { authMiddleware } = await import('../middleware/auth');
+        const { req, res, next } = createMockReqRes({
+            xApiKey: 'key-2',
+        });
+
+        authMiddleware(req as Request, res as Response, next as NextFunction);
+
+        expect(next).toHaveBeenCalled();
+    });
+
+    test('escalates brute-force lockouts exponentially', async () => {
+        jest.useFakeTimers();
+        process.env['SCG_API_KEYS'] = 'correct-key';
+        const { authMiddleware, currentLockoutMsForIp } = await import('../middleware/auth');
+
+        for (let i = 0; i < 5; i++) {
+            const { req, res, next } = createMockReqRes({
+                authorization: 'Bearer wrong-key',
+                ip: '10.0.0.9',
+            });
+            authMiddleware(req as Request, res as Response, next as NextFunction);
+            expect(res.statusCode).toBe(403);
+        }
+
+        expect(currentLockoutMsForIp('10.0.0.9')).toBeGreaterThanOrEqual(30_000);
+
+        const throttled = createMockReqRes({
+            authorization: 'Bearer wrong-key',
+            ip: '10.0.0.9',
+        });
+        throttled.req.correlationId = 'req-throttle';
+        authMiddleware(throttled.req as Request, throttled.res as Response, throttled.next as NextFunction);
+        expect(throttled.res.statusCode).toBe(429);
+        expect(throttled.res.headers?.['Retry-After']).toBe('30');
+        expect(throttled.res.body).toEqual(expect.objectContaining({ correlationId: 'req-throttle' }));
+
+        jest.advanceTimersByTime(30_000);
+
+        const nextFailure = createMockReqRes({
+            authorization: 'Bearer wrong-key',
+            ip: '10.0.0.9',
+        });
+        authMiddleware(nextFailure.req as Request, nextFailure.res as Response, nextFailure.next as NextFunction);
+        expect(nextFailure.res.statusCode).toBe(403);
+        expect(currentLockoutMsForIp('10.0.0.9')).toBeGreaterThanOrEqual(60_000);
+    });
+});
