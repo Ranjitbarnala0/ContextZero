@@ -248,6 +248,16 @@ export async function ensureAllowedRepoPath(repoPath: string, options?: AllowedR
     if (!allowedBasePaths.some(base => isPathWithinBase(base, resolvedPath))) {
         throw new Error('Allowed base path violation: repo_path is not under any configured SCG_ALLOWED_BASE_PATHS');
     }
+
+    // Verify directory is a git repository before accepting it
+    try {
+        await fsp.access(path.join(resolvedPath, '.git'));
+    } catch {
+        throw new Error(
+            `repo_path is not a git repository (no .git found): ${resolvedPath}`
+        );
+    }
+
     return resolvedPath;
 }
 

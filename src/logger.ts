@@ -18,6 +18,8 @@ interface LogEntry {
     stack?: string;
 }
 
+export type LogWriter = (line: string) => void;
+
 export class Logger {
     private subsystem: string;
     private minLevel: LogLevel;
@@ -27,6 +29,19 @@ export class Logger {
     };
 
     private static readonly VALID_LEVELS: ReadonlySet<string> = new Set(['debug', 'info', 'warn', 'error', 'fatal']);
+
+    /** Pluggable output sink. Defaults to stderr. Override to redirect logs (e.g. in TUI mode). */
+    private static writer: LogWriter = (line: string) => process.stderr.write(line + '\n');
+
+    /** Replace the global log output sink for all Logger instances. */
+    public static setWriter(writer: LogWriter): void {
+        Logger.writer = writer;
+    }
+
+    /** Restore the default stderr writer. */
+    public static resetWriter(): void {
+        Logger.writer = (line: string) => process.stderr.write(line + '\n');
+    }
 
     constructor(subsystem: string, minLevel?: LogLevel, context?: Record<string, unknown>) {
         this.subsystem = subsystem;
@@ -90,11 +105,7 @@ export class Logger {
                 },
             });
         }
-        // All log output goes to stderr. This prevents structured log JSON
-        // from corrupting the MCP stdio transport (which uses stdout for
-        // JSON-RPC). For the REST API server, stderr is the standard
-        // destination for application logs (12-factor app methodology).
-        process.stderr.write(output + '\n');
+        Logger.writer(output);
     }
 
     public debug(message: string, data?: Record<string, unknown>): void {

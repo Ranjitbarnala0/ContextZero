@@ -14,6 +14,8 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
 
 const execFileAsync = promisify(execFile);
 import { v4 as uuidv4 } from 'uuid';
@@ -210,6 +212,13 @@ export class TemporalEngine {
     ): Promise<GitCommit[]> {
         const timer = log.startTimer('mineGitHistory', { repoBasePath, maxCommits });
 
+        // Pre-check: skip non-git directories instead of crashing
+        if (!fs.existsSync(path.join(repoBasePath, '.git'))) {
+            log.info('Not a git repository — skipping git history mining', { repoBasePath });
+            timer({ commits: 0 });
+            return [];
+        }
+
         let raw: string;
         try {
             const result = await execFileAsync('git', [
@@ -232,7 +241,7 @@ export class TemporalEngine {
             if (message.includes('does not have any commits') ||
                 message.includes('not a git repository') ||
                 message.includes('bad default revision')) {
-                log.warn('Git log returned no data', { repoBasePath, error: message });
+                log.debug('Git log returned no data', { repoBasePath, error: message });
                 timer({ commits: 0 });
                 return [];
             }
@@ -642,6 +651,12 @@ export class TemporalEngine {
                 ownership_type: 'orphaned',
                 contributors: [],
             };
+        }
+
+        // Pre-check: skip non-git directories instead of crashing
+        if (!fs.existsSync(path.join(repoBasePath, '.git'))) {
+            log.info('Not a git repository — skipping ownership analysis', { repoBasePath });
+            return { primary_owner: null, ownership_type: 'orphaned', contributors: [] };
         }
 
         // Mine git log for these specific files
