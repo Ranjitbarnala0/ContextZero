@@ -288,7 +288,7 @@ app.get('/health', safeHandler(async (req, res) => {
                AND updated_at < NOW() - INTERVAL '1 minute' * $1`,
             [retentionConfig.staleTransactionTimeoutMinutes],
         );
-        staleTransactionCount = (staleResult.rows[0] as { cnt: number })?.cnt ?? 0;
+        staleTransactionCount = parseCountField(firstRow(staleResult));
     } catch { /* best-effort */ }
 
     res.status(status).json({
@@ -1344,15 +1344,13 @@ app.post('/scg_get_tests',
         symbol_id: requireUUID,
         snapshot_id: requireUUID,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await getTests({
-                symbol_id: req.body.symbol_id,
-                snapshot_id: req.body.snapshot_id,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await getTests({
+            symbol_id: req.body.symbol_id,
+            snapshot_id: req.body.snapshot_id,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 31: Explain Relation ──────────
@@ -1364,16 +1362,14 @@ app.post('/scg_explain_relation',
         dst_symbol_version_id: requireUUID,
         snapshot_id: requireUUID,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await explainRelation({
-                src_symbol_version_id: req.body.src_symbol_version_id,
-                dst_symbol_version_id: req.body.dst_symbol_version_id,
-                snapshot_id: req.body.snapshot_id,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await explainRelation({
+            src_symbol_version_id: req.body.src_symbol_version_id,
+            dst_symbol_version_id: req.body.dst_symbol_version_id,
+            snapshot_id: req.body.snapshot_id,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 32: Get Neighbors ──────────
@@ -1387,22 +1383,20 @@ app.post('/scg_get_neighbors',
         depth: optionalBoundedInt(1, MAX_GRAPH_DEPTH),
         max_nodes: optionalBoundedInt(1, 500),
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const relation_types = Array.isArray(req.body.relation_types)
-                ? (req.body.relation_types as unknown[]).filter((t): t is string => typeof t === 'string')
-                : undefined;
-            const result = await getNeighbors({
-                symbol_version_id: req.body.symbol_version_id,
-                snapshot_id: req.body.snapshot_id,
-                direction: req.body.direction || 'both',
-                depth: req.body.depth || 2,
-                max_nodes: req.body.max_nodes || 100,
-                relation_types,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const relation_types = Array.isArray(req.body.relation_types)
+            ? (req.body.relation_types as unknown[]).filter((t): t is string => typeof t === 'string')
+            : undefined;
+        const result = await getNeighbors({
+            symbol_version_id: req.body.symbol_version_id,
+            snapshot_id: req.body.snapshot_id,
+            direction: req.body.direction || 'both',
+            depth: req.body.depth || 2,
+            max_nodes: req.body.max_nodes || 100,
+            relation_types,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 33: Find Concept ──────────
@@ -1417,19 +1411,17 @@ app.post('/scg_find_concept',
         language_filter: optionalString,
         limit: optionalBoundedInt(1, MAX_LIST_LIMIT),
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await findConcept({
-                concept: req.body.concept,
-                repo_id: req.body.repo_id,
-                snapshot_id: req.body.snapshot_id,
-                kind_filter: req.body.kind_filter,
-                language_filter: req.body.language_filter,
-                limit: req.body.limit || 20,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await findConcept({
+            concept: req.body.concept,
+            repo_id: req.body.repo_id,
+            snapshot_id: req.body.snapshot_id,
+            kind_filter: req.body.kind_filter,
+            language_filter: req.body.language_filter,
+            limit: req.body.limit || 20,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 34: Semantic Diff ──────────
@@ -1440,15 +1432,13 @@ app.post('/scg_semantic_diff',
         before_symbol_version_id: requireUUID,
         after_symbol_version_id: requireUUID,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await computeSemanticDiff({
-                before_symbol_version_id: req.body.before_symbol_version_id,
-                after_symbol_version_id: req.body.after_symbol_version_id,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await computeSemanticDiff({
+            before_symbol_version_id: req.body.before_symbol_version_id,
+            after_symbol_version_id: req.body.after_symbol_version_id,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 35: Contract Diff ──────────
@@ -1460,20 +1450,18 @@ app.post('/scg_contract_diff',
         after_symbol_version_id: optionalUUID,
         txn_id: optionalUUID,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            if (!req.body.txn_id && (!req.body.before_symbol_version_id || !req.body.after_symbol_version_id)) {
-                res.status(400).json({ error: 'Either txn_id or both before/after symbol_version_ids are required' });
-                return;
-            }
-            const result = await computeContractDiff({
-                before_symbol_version_id: req.body.before_symbol_version_id,
-                after_symbol_version_id: req.body.after_symbol_version_id,
-                txn_id: req.body.txn_id,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        if (!req.body.txn_id && (!req.body.before_symbol_version_id || !req.body.after_symbol_version_id)) {
+            res.status(400).json({ error: 'Either txn_id or both before/after symbol_version_ids are required' });
+            return;
+        }
+        const result = await computeContractDiff({
+            before_symbol_version_id: req.body.before_symbol_version_id,
+            after_symbol_version_id: req.body.after_symbol_version_id,
+            txn_id: req.body.txn_id,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 36: Plan Change ──────────
@@ -1486,18 +1474,16 @@ app.post('/scg_plan_change',
         task_description: requireString,
         max_candidates: optionalBoundedInt(1, 20),
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await planChange({
-                repo_id: req.body.repo_id,
-                snapshot_id: req.body.snapshot_id,
-                task_description: req.body.task_description,
-                max_candidates: req.body.max_candidates || 5,
-                scope_constraints: req.body.scope_constraints,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await planChange({
+            repo_id: req.body.repo_id,
+            snapshot_id: req.body.snapshot_id,
+            task_description: req.body.task_description,
+            max_candidates: req.body.max_candidates || 5,
+            scope_constraints: req.body.scope_constraints,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 37: Prepare Change ──────────
@@ -1511,18 +1497,16 @@ app.post('/scg_prepare_change',
         plan_id: optionalUUID,
         created_by: optionalString,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await prepareChange({
-                repo_id: req.body.repo_id,
-                base_snapshot_id: req.body.base_snapshot_id,
-                target_symbol_version_ids: req.body.target_symbol_version_ids,
-                plan_id: req.body.plan_id,
-                created_by: req.body.created_by || 'api',
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await prepareChange({
+            repo_id: req.body.repo_id,
+            base_snapshot_id: req.body.base_snapshot_id,
+            target_symbol_version_ids: req.body.target_symbol_version_ids,
+            plan_id: req.body.plan_id,
+            created_by: req.body.created_by || 'api',
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 38: Apply Propagation ──────────
@@ -1533,21 +1517,19 @@ app.post('/scg_apply_propagation',
         txn_id: requireUUID,
         target_symbol_version_id: requireUUID,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const patch = req.body.patch;
-            if (!patch || typeof patch !== 'object' || typeof patch.file_path !== 'string' || typeof patch.new_content !== 'string') {
-                res.status(400).json({ error: 'patch must be an object with file_path and new_content' });
-                return;
-            }
-            const result = await applyPropagation({
-                txn_id: req.body.txn_id,
-                target_symbol_version_id: req.body.target_symbol_version_id,
-                patch: { file_path: patch.file_path, new_content: patch.new_content },
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const patch = req.body.patch;
+        if (!patch || typeof patch !== 'object' || typeof patch.file_path !== 'string' || typeof patch.new_content !== 'string') {
+            res.status(400).json({ error: 'patch must be an object with file_path and new_content' });
+            return;
+        }
+        const result = await applyPropagation({
+            txn_id: req.body.txn_id,
+            target_symbol_version_id: req.body.target_symbol_version_id,
+            patch: { file_path: patch.file_path, new_content: patch.new_content },
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Tool 39: Review Homolog ──────────
@@ -1559,16 +1541,14 @@ app.post('/scg_review_homolog',
         review_state: requireEnum('confirmed', 'rejected', 'flagged'),
         reviewer: optionalString,
     }),
-    async (req: Request, res: Response, next: NextFunction) => {
-        try {
-            const result = await reviewHomolog({
-                inferred_relation_id: req.body.inferred_relation_id,
-                review_state: req.body.review_state,
-                reviewer: req.body.reviewer,
-            });
-            res.json({ data: result });
-        } catch (e) { next(e); }
-    },
+    safeHandler(async (req, res) => {
+        const result = await reviewHomolog({
+            inferred_relation_id: req.body.inferred_relation_id,
+            review_state: req.body.review_state,
+            reviewer: req.body.reviewer,
+        });
+        res.json({ data: result });
+    }),
 );
 
 // ────────── Admin Tools (Retention, Stats, Diagnostics) ──────────

@@ -66,10 +66,24 @@ export class LRUCache<T = unknown> {
                 this.store.delete(firstKey);
             }
         }
-        const effectiveTtl = Math.max(1, ttlMs ?? this.defaultTTLMs);
+
+        // When updating an existing entry without an explicit TTL,
+        // preserve the remaining TTL from the original entry.
+        let expiresAt: number;
+        if (ttlMs !== undefined) {
+            expiresAt = Date.now() + Math.max(1, ttlMs);
+        } else {
+            const existing = this.store.get(key);
+            if (existing && existing.expiresAt > Date.now()) {
+                expiresAt = existing.expiresAt;
+            } else {
+                expiresAt = Date.now() + this.defaultTTLMs;
+            }
+        }
+
         this.store.set(key, {
             value,
-            expiresAt: Date.now() + effectiveTtl,
+            expiresAt,
             accessedAt: Date.now(),
         });
     }
