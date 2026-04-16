@@ -10,16 +10,20 @@
 -- physical ordering correlates with logical ordering. Much smaller than B-tree
 -- while supporting range scans efficiently.
 
-CREATE INDEX IF NOT EXISTS idx_temporal_co_changes_created_brin
-    ON temporal_co_changes USING brin (created_at)
+-- NOTE: each temporal table has its own insertion-ordered timestamp column
+-- (computed_at / first_observed / created_at). They are all NOT NULL and
+-- populated at INSERT time, so BRIN works on all of them.
+
+CREATE INDEX IF NOT EXISTS idx_temporal_co_changes_computed_brin
+    ON temporal_co_changes USING brin (computed_at)
     WITH (pages_per_range = 32);
 
-CREATE INDEX IF NOT EXISTS idx_temporal_risk_scores_created_brin
-    ON temporal_risk_scores USING brin (created_at)
+CREATE INDEX IF NOT EXISTS idx_temporal_risk_scores_computed_brin
+    ON temporal_risk_scores USING brin (computed_at)
     WITH (pages_per_range = 32);
 
-CREATE INDEX IF NOT EXISTS idx_runtime_observed_edges_created_brin
-    ON runtime_observed_edges USING brin (created_at)
+CREATE INDEX IF NOT EXISTS idx_runtime_observed_edges_observed_brin
+    ON runtime_observed_edges USING brin (first_observed)
     WITH (pages_per_range = 32);
 
 CREATE INDEX IF NOT EXISTS idx_runtime_traces_created_brin
