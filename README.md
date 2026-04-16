@@ -14,9 +14,34 @@ AI coding agents read files one at a time. To understand a single function chang
 
 ---
 
-## Measured Results: 5 Real Tasks, Head-to-Head
+## Measured Results
 
-Same codebase (91 files, 4,374 symbols). Same 5 tasks. Traditional file reading vs ContextZero. Real numbers.
+### Randomised head-to-head (reproducible)
+
+On ContextZero's own codebase (98 files, 4,930 symbols), the benchmark in `scripts/bench-head-to-head.ts` picks 10 real random functions or classes. For each one it measures what an AI agent pulls into context **two ways**:
+
+- **Traditional** — `grep -rlw <name>` + `Read` every file that matches.
+- **ContextZero** — one `compile_context_capsule` call in strict mode.
+
+Representative run (10 random targets, full transcript in the script):
+
+| | Traditional | ContextZero | Reduction |
+|--|-------------|-------------|-----------|
+| **Tool calls** | 41 | 10 | **4.1× fewer** |
+| **Files read** | 31 | — | — |
+| **Tokens** | **408,447** | **45,436** | **9.0× fewer** |
+
+Per-target token ratios range from **0.85×** (tiny isolated symbols) to **30.65×** (dependency-heavy symbols). The aggregate is the number to plan around.
+
+```bash
+# Reproduce on your own machine:
+npm run build
+DB_NAME=scg_v2 npx ts-node scripts/bench-head-to-head.ts 10
+```
+
+### Curated task-by-task comparison
+
+Five concrete code-cognition tasks on the same codebase. File-reading numbers measure what an agent using only `Grep`/`Read` consumes; ContextZero numbers are the response size of a single MCP tool call.
 
 ### Task 1: "Understand this function and everything it depends on"
 
@@ -160,26 +185,34 @@ createdb scg_v2
 psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 ```
 
-Set environment variables:
+Set environment variables (copy `.env.example` to `.env` and edit):
 
 ```bash
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_NAME=scg_v2
-export DB_USER=your_user
-export DB_PASSWORD=your_password
-export NODE_ENV=development
-export LOG_LEVEL=info
-export SCG_ALLOWED_BASE_PATHS=/your/code/directory
+DB_HOST=localhost         # or an absolute path like /var/run/postgresql for unix-socket peer auth
+DB_PORT=5432
+DB_NAME=scg_v2
+DB_USER=your_user
+DB_PASSWORD=your_password # empty string OK when NODE_ENV != production
+NODE_ENV=development
+LOG_LEVEL=info
+SCG_ALLOWED_BASE_PATHS=/path/to/one/or/more/code/dirs,separated,by,commas
+SCG_API_KEYS=generate-with-openssl-rand-hex-32    # only enforced by HTTP server
 ```
 
-Build and start:
+Build, migrate, start:
 
 ```bash
 npm run build
+npm run db:migrate     # applies all 17 migrations
 npm start              # HTTP server on port 3100
 # or
 npm run mcp            # MCP stdio bridge
+```
+
+Run the test suite if you want to verify your install:
+
+```bash
+npm test               # 40 suites / 1,441 tests / ~15s, 100% pass on a clean DB
 ```
 
 ### Connect to Claude Code
@@ -207,9 +240,18 @@ docker compose up -d
 
 Ask Claude Code to run `scg_health_check`. You should see `status: healthy` with DB latency and version.
 
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `column "created_at" does not exist` during `npm run db:migrate` | Running against a database populated by an older checkout before migration 014 was self-contained | Drop the DB (`dropdb scg_v2`) and re-run migrations from scratch, or apply only the missing migrations |
+| `Refusing to connect to a remote database without SSL in production` | `NODE_ENV=production` with a `DB_HOST` the config doesn't recognise as local | Use `localhost`, `127.0.0.1`, `::1`, or a Unix socket path starting with `/` (e.g. `/var/run/postgresql`). For a genuinely remote DB, set `DB_SSL_MODE=require` |
+| `repo_path is not a git repository (no .git found)` when calling a workspace tool | Target directory isn't under version control | `git init` the directory or point to a real repo root |
+| `pg_trgm extension is NOT installed` warning in logs | Extension missing from the database | `psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"` |
+
 ---
 
-## 56 MCP Tools
+## 61 MCP Tools
 
 | Category | Tools | Count |
 |----------|-------|-------|
@@ -222,8 +264,9 @@ Ask Claude Code to run `scg_health_check`. You should see `status: healthy` with
 | **Transactional Editing** | `scg_create_change_transaction` `scg_get_transaction` `scg_apply_patch` `scg_validate_change` `scg_commit_change` `scg_rollback_change` | 6 |
 | **Data Management** | `scg_list_snapshots` `scg_batch_embed` `scg_ingest_runtime_trace` | 3 |
 | **Native Workspace** | `scg_native_codebase_overview` `scg_native_symbol_search` `scg_native_search_code` | 3 |
+| **Admin & Operations** | `scg_admin_system_info` `scg_admin_db_stats` `scg_admin_retention_stats` `scg_admin_run_retention` `scg_admin_cleanup_stale` | 5 |
 
-The 3 **Native Workspace** tools work without a database — they analyze the filesystem directly and are available immediately without ingestion.
+The 3 **Native Workspace** tools work without a database — they analyze the filesystem directly and are available immediately without ingestion. The 5 **Admin** tools expose system diagnostics and manual retention operations for operators.
 
 ---
 
