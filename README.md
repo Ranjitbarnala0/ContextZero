@@ -240,6 +240,43 @@ docker compose up -d
 
 Ask Claude Code to run `scg_health_check`. You should see `status: healthy` with DB latency and version.
 
+### Index your first repository
+
+The most common setup mistake is not telling ContextZero which directories it is allowed to read. It fails closed by design — if `SCG_ALLOWED_BASE_PATHS` is empty, **every** repository call is rejected. Set it to the parent directory that contains the repos you want to index (comma-separated if more than one):
+
+```bash
+# .env (or MCP -e flags, or docker-compose env)
+SCG_ALLOWED_BASE_PATHS=/home/me/code,/home/me/work
+```
+
+Then, from your AI tool, call `scg_ingest_repo` with **just the absolute path** — ContextZero auto-registers the repo on first call, so you don't have to run `scg_register_repo` separately:
+
+```jsonc
+// Claude Code / Cursor / Windsurf — ask the assistant to run this tool:
+{
+  "tool": "scg_ingest_repo",
+  "repo_path": "/home/me/code/my-project"
+}
+```
+
+Or hit the HTTP API directly:
+
+```bash
+curl -X POST http://localhost:3100/scg_ingest_repo \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $SCG_API_KEYS" \
+  -d '{"repo_path": "/home/me/code/my-project"}'
+```
+
+What happens:
+
+1. ContextZero checks that `/home/me/code/my-project` is under one of the allowed base paths.
+2. It requires the directory to be a git repository (`git init` one if needed).
+3. It auto-registers the repo, creates a snapshot at the current `HEAD`, and runs all 13 analysis engines. Typical throughput is ~3 files/sec.
+4. Subsequent calls to `scg_incremental_index` on the same repo only re-analyse files whose content hash changed.
+
+After ingestion completes you can use any of the 61 MCP tools against this repo. For a full guided first query, ask your AI assistant: *"Compile a strict context capsule for the largest function in my-project."* That runs a single `scg_compile_context_capsule` call and returns the target + blast radius + callers + contracts pre-assembled.
+
 ### Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -248,6 +285,9 @@ Ask Claude Code to run `scg_health_check`. You should see `status: healthy` with
 | `Refusing to connect to a remote database without SSL in production` | `NODE_ENV=production` with a `DB_HOST` the config doesn't recognise as local | Use `localhost`, `127.0.0.1`, `::1`, or a Unix socket path starting with `/` (e.g. `/var/run/postgresql`). For a genuinely remote DB, set `DB_SSL_MODE=require` |
 | `repo_path is not a git repository (no .git found)` when calling a workspace tool | Target directory isn't under version control | `git init` the directory or point to a real repo root |
 | `pg_trgm extension is NOT installed` warning in logs | Extension missing from the database | `psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"` |
+| `Allowed base path violation: repo_path is not under any configured SCG_ALLOWED_BASE_PATHS` | The directory you passed is outside every path in `SCG_ALLOWED_BASE_PATHS` (fail-closed by design) | Add the parent directory (or the repo itself) to `SCG_ALLOWED_BASE_PATHS` — comma-separated for multiple roots — then restart the server |
+| `Repository not found. Register it first via scg_register_repo` when passing a `repo_id` | The UUID doesn't exist in the registry | Pass `repo_path` instead of `repo_id` — `scg_ingest_repo` auto-registers on first call, or list existing repos with `scg_list_repos` |
+| `Database overloaded: N queries waiting (max 40). Rejecting to prevent cascade.` on heavy workloads | Pool pressure guard firing | Lower ingestion concurrency, or raise `DB_MAX_CONNECTIONS` in `.env` (default is 20) |
 
 ---
 

@@ -28,7 +28,9 @@ import { capsuleCompiler } from '../src/analysis-engine/capsule-compiler';
 import { blastRadiusEngine } from '../src/analysis-engine/blast-radius';
 import { db } from '../src/db-driver';
 
-const REPO = '/home/mani/Desktop/ContextZero';
+// Repo root for the traditional "grep -rlw <name>" step. Pass as argv[3],
+// else set REPO_PATH, else fall back to the current working directory.
+const REPO = path.resolve(process.argv[3] || process.env.REPO_PATH || process.cwd());
 
 function tokensFromBytes(bytes: number): number {
     return Math.round(bytes / 4);
