@@ -159,8 +159,8 @@ All caches: LRU with TTL, periodic cleanup, automatic invalidation on incrementa
 
 | Metric | Value |
 |--------|-------|
-| Test suites | **38** |
-| Test cases | **1,419** |
+| Test suites | **40** |
+| Test cases | **1,441** |
 | Pass rate | **100%** |
 | Test lines of code | **17,728** |
 | CI pipeline | TypeCheck + Lint + Tests (PostgreSQL 16) + Build |
