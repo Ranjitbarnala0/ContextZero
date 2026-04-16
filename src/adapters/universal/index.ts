@@ -397,13 +397,57 @@ function getNodeName(node: SyntaxNode, language: SupportedLanguage): string | nu
         }
     }
 
-    // Kotlin/Swift: some grammars don't use 'name' field — look for identifier children
-    // Kotlin uses simple_identifier, Swift uses identifier, etc.
+    // Kotlin: property_declaration wraps the name in a variable_declaration child.
+    // Naive scan would pick up the RHS initializer identifier (e.g. `val state = _state`
+    // would return `_state` instead of `state`).
+    if (language === 'kotlin' && node.type === 'property_declaration') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (!child) continue;
+            if (child.type === 'variable_declaration') {
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const inner = child.namedChild(j);
+                    if (!inner) continue;
+                    if (inner.type === 'simple_identifier') return inner.text;
+                }
+            }
+            if (child.type === 'multi_variable_declaration') {
+                // Destructuring: take the first identifier
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const vd = child.namedChild(j);
+                    if (vd?.type === 'variable_declaration') {
+                        const id = vd.namedChild(0);
+                        if (id?.type === 'simple_identifier') return id.text;
+                    }
+                }
+            }
+        }
+        return null; // Don't fall through to generic scan; would pick up RHS
+    }
+
+    // Kotlin function_declaration / class_declaration: skip over `modifiers` when scanning,
+    // so the first actual identifier wins.
+    if (language === 'kotlin') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (!child) continue;
+            if (child.type === 'modifiers') continue;
+            if (child.type === 'simple_identifier' || child.type === 'type_identifier') {
+                return child.text;
+            }
+            // For class_declaration, the type_identifier comes after 'class' keyword,
+            // so scan only the first 4 named children to avoid pulling names from the body.
+            if (i >= 3) break;
+        }
+        return null;
+    }
+
+    // Swift/PHP/Bash/other: look for identifier children in the first few slots.
     for (let i = 0; i < Math.min(node.namedChildCount, 5); i++) {
         const child = node.namedChild(i);
         if (!child) continue;
         if (child.type === 'simple_identifier' || child.type === 'type_identifier' ||
-            child.type === 'word') {
+            child.type === 'word' || child.type === 'identifier') {
             return child.text;
         }
     }
@@ -3442,24 +3486,40 @@ function walkNode(
     // per-language case blocks. This provides immediate production-grade
     // support for any language with a tree-sitter grammar.
     if (ctx.symbolTypeSet.has(nodeType)) {
+        // Skip local variables: Kotlin/Swift/PHP emit property/variable declarations
+        // for both class members AND function-local `val`/`let`/`$var`. Only the
+        // class-member form should become a durable symbol.
+        if (isLocalVariableDeclaration(node, lang)) {
+            recurseChildren(node, ctx, parentName, parentClassNode);
+            return;
+        }
+
         const name = getNodeName(node, lang);
         if (!name) { recurseChildren(node, ctx, parentName, parentClassNode); return; }
         emitSymbol(node, name, ctx, parentName, parentClassNode);
 
-        // If it's a class-like or module-like node, recurse into its body
         const kind = classifyKind(node, lang);
         if (kind === 'class' || kind === 'interface' || kind === 'module' || kind === 'enum') {
             const stableKey = makeStableKey(ctx.filePath, parentName, name);
             extractInheritanceRelations(node, stableKey, lang, ctx.relations);
-            // Try to find body/member container and recurse into it
-            const body = node.childForFieldName('body') ||
-                         node.childForFieldName('class_body') ||
-                         node.childForFieldName('members');
+            const body = findBodyContainer(node);
             if (body) {
                 for (let i = 0; i < body.namedChildCount; i++) {
                     const member = body.namedChild(i);
                     if (member) walkNode(member, ctx, name, node);
                 }
+            }
+            return;
+        }
+
+        // For function/method kinds, also descend into the body to find nested
+        // symbols (anonymous objects with method overrides, nested classes/fns,
+        // inner enums, etc.). Parent stays the enclosing class/module so nested
+        // symbols keep the original class context.
+        if (kind === 'function' || kind === 'method') {
+            const body = node.childForFieldName('body') || findBodyContainer(node);
+            if (body) {
+                recurseChildren(body, ctx, parentName, parentClassNode);
             }
         }
         return;
@@ -3467,6 +3527,86 @@ function walkNode(
 
     // Fallback: recurse into children for unknown node types
     recurseChildren(node, ctx, parentName, parentClassNode);
+}
+
+/**
+ * Locate the declarations container under a class/interface/module-like node.
+ *
+ * tree-sitter grammars disagree on how body containers are exposed:
+ *   - Java / Python / C++ / Go expose a named field `body`
+ *   - Kotlin uses child types `class_body` / `enum_class_body` with no field
+ *   - Swift uses `class_body` / `protocol_body` / `enum_declaration_body`
+ *   - PHP uses `declaration_list` / `use_list`
+ *   - Bash uses `compound_statement`
+ *
+ * Strategy: try common field names first (fast path), then scan named
+ * children for any node whose type contains `body`, `members`,
+ * `declaration_list`, or `compound_statement`.
+ */
+/**
+ * Return true when a property/variable declaration is a function-local
+ * (e.g. `val text = …` inside a Kotlin method body) rather than a class
+ * member. Class members live directly under a class/interface/object body;
+ * locals live under function_body / statements / block / compound_statement.
+ */
+function isLocalVariableDeclaration(node: SyntaxNode, language: SupportedLanguage): boolean {
+    const t = node.type;
+    const propLikeTypes = new Set([
+        'property_declaration',     // Kotlin
+        'property_definition',      // some grammars
+        'variable_declaration',     // when treated as symbol
+    ]);
+    if (!propLikeTypes.has(t)) return false;
+
+    let p: SyntaxNode | null = node.parent;
+    while (p) {
+        const pt = p.type;
+        // Stop immediately when we reach a class/interface/object/module container —
+        // that means this declaration IS a class-level member.
+        if (pt === 'class_body' || pt === 'enum_class_body' || pt === 'enum_body' ||
+            pt === 'interface_body' || pt === 'object_body' || pt === 'protocol_body' ||
+            pt === 'struct_body' || pt === 'trait_body' || pt === 'members' ||
+            pt === 'member_list' || pt === 'declaration_list') {
+            return false;
+        }
+        // Inside a function body / block / statements, this is a local.
+        if (pt === 'function_body' || pt === 'function_declaration' ||
+            pt === 'block' || pt === 'statements' ||
+            pt === 'compound_statement' || pt === 'lambda_literal' ||
+            pt === 'anonymous_function') {
+            return true;
+        }
+        p = p.parent;
+    }
+    // Top-level declarations (rare for Kotlin properties, valid for Swift/PHP) keep them.
+    return false;
+    // The `language` parameter is currently unused — kept for future overrides
+    // (e.g. Python walrus operator, JS block-scoped `let`).
+    void language;
+}
+
+function findBodyContainer(node: SyntaxNode): SyntaxNode | null {
+    const byField =
+        node.childForFieldName('body') ||
+        node.childForFieldName('class_body') ||
+        node.childForFieldName('members') ||
+        node.childForFieldName('declaration_list');
+    if (byField) return byField;
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (!child) continue;
+        const t = child.type;
+        if (t === 'body' || t === 'class_body' || t === 'enum_class_body' ||
+            t === 'enum_body' || t === 'interface_body' || t === 'protocol_body' ||
+            t === 'struct_body' || t === 'object_body' || t === 'trait_body' ||
+            t === 'members' || t === 'member_list' ||
+            t === 'declaration_list' || t === 'compound_statement' ||
+            t.endsWith('_body')) {
+            return child;
+        }
+    }
+    return null;
 }
 
 function recurseChildren(
@@ -3506,15 +3646,13 @@ function emitSymbol(
         visibility = detectVisibility(node, ctx.source, ctx.language, parentClassNode);
     }
 
-    // For methods inside a class, override kind to 'method' across all languages
+    // For methods inside a class, override kind to 'method' across all languages.
+    // Java/C# constructor and method declarations already classified as 'method' by classifyKind.
+    // Any language whose function_declaration node lives inside a class_body is a method.
     let effectiveKind = kind;
     if (parentName !== null && kind === 'function') {
-        const methodLangs: SupportedLanguage[] = ['python', 'cpp', 'rust', 'ruby'];
-        if (methodLangs.includes(ctx.language)) {
-            effectiveKind = 'method';
-        }
+        effectiveKind = 'method';
     }
-    // Java/C# constructor and method declarations already classified as 'method' by classifyKind
 
     ctx.symbols.push({
         stable_key: stableKey,

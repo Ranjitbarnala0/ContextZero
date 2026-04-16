@@ -304,7 +304,10 @@ describe('Pipeline Integration — Relation Extraction', () => {
         const calls = result.relations.filter(r => r.relation_type === 'calls');
         expect(calls.length).toBeGreaterThanOrEqual(1);
         const targets = calls.map(r => r.target_name);
-        expect(targets).toContain('query');
+        // TS adapter emits full-chain call targets (db.query, not bare `query`).
+        // Bare-name targets were removed because they resolved non-deterministically
+        // during structural graph resolution and corrupted behavioral propagation.
+        expect(targets).toContain('db.query');
     });
 
     test('call relations reference correct source symbols', () => {

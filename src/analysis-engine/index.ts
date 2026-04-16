@@ -35,57 +35,83 @@ export class StructuralGraphEngine {
             return 0;
         }
 
-        // Load symbol versions for this snapshot, indexed by stable_key and canonical_name
+        // Load symbol versions for this snapshot, indexed by stable_key and canonical_name.
+        // svByCanonical is a multi-map: a canonical name can belong to many symbol
+        // versions (every method called `find`, `update`, `destroy`…). When a
+        // caller references a bare name that has multiple candidates, we SKIP the
+        // relation rather than picking an arbitrary one — arbitrary resolution
+        // floods behavioral propagation with false effects and distorts the
+        // call graph. Precise resolution belongs to the dispatch resolver.
         const svRows = await coreDataService.getSymbolVersionsForSnapshot(snapshotId);
         const svByKey = new Map<string, string>();
-        const svByCanonical = new Map<string, string>();
+        const svByCanonical = new Map<string, string[]>();
 
         for (const sv of svRows) {
             svByKey.set(sv.stable_key, sv.symbol_version_id);
-            svByCanonical.set(sv.canonical_name, sv.symbol_version_id);
+            const existing = svByCanonical.get(sv.canonical_name);
+            if (existing) existing.push(sv.symbol_version_id);
+            else svByCanonical.set(sv.canonical_name, [sv.symbol_version_id]);
         }
 
-        // First pass: collect all target names that can't be resolved from in-memory maps
+        /** Resolve a target name through stable_key → unambiguous canonical. */
+        const resolveInMemory = (targetName: string): string | null => {
+            const keyHit = svByKey.get(targetName);
+            if (keyHit) return keyHit;
+            const canonicalHits = svByCanonical.get(targetName);
+            if (canonicalHits && canonicalHits.length === 1) return canonicalHits[0] ?? null;
+            return null;
+        };
+
+        // First pass: collect unresolved target names for a batched DB lookup.
         const unresolvedTargets = new Set<string>();
         for (const rel of rawRelations) {
-            const srcSvId = svByKey.get(rel.source_key);
-            if (!srcSvId) continue;
-            const dstSvId = svByKey.get(rel.target_name) || svByCanonical.get(rel.target_name);
-            if (!dstSvId) {
-                unresolvedTargets.add(rel.target_name);
-            }
+            if (!svByKey.has(rel.source_key)) continue;
+            if (resolveInMemory(rel.target_name)) continue;
+            if (svByCanonical.has(rel.target_name)) continue; // ambiguous; skip, don't probe DB
+            unresolvedTargets.add(rel.target_name);
         }
 
-        // Batch-resolve all unresolved targets in chunked queries (avoids N+1)
+        // Batch-resolve unique names only (a name that appears more than once is
+        // ambiguous and we'd skip it anyway). The DB query already groups by
+        // canonical_name so duplicates across snapshots are collapsed.
         const CHUNK_SIZE = 5000;
         const resolvedFromDb = new Map<string, string>();
+        const ambiguousInDb = new Set<string>();
         if (unresolvedTargets.size > 0) {
             const targetNames = Array.from(unresolvedTargets);
             for (let i = 0; i < targetNames.length; i += CHUNK_SIZE) {
                 const chunk = targetNames.slice(i, i + CHUNK_SIZE);
                 const placeholders = chunk.map((_, j) => `$${j + 3}`).join(',');
                 const dbResult = await db.query(`
-                    SELECT DISTINCT ON (s.canonical_name) sv.symbol_version_id, s.canonical_name
+                    SELECT s.canonical_name, COUNT(*) AS cnt,
+                           MIN(sv.symbol_version_id::text) AS sample_id
                     FROM symbol_versions sv
                     JOIN symbols s ON s.symbol_id = sv.symbol_id
                     WHERE s.repo_id = $1 AND sv.snapshot_id = $2
                     AND s.canonical_name IN (${placeholders})
-                    ORDER BY s.canonical_name, sv.symbol_version_id
+                    GROUP BY s.canonical_name
                 `, [repoId, snapshotId, ...chunk]);
-                for (const row of dbResult.rows as { symbol_version_id: string; canonical_name: string }[]) {
-                    resolvedFromDb.set(row.canonical_name, row.symbol_version_id);
+                for (const row of dbResult.rows as { canonical_name: string; cnt: string; sample_id: string }[]) {
+                    const count = parseInt(row.cnt, 10);
+                    if (count === 1) {
+                        resolvedFromDb.set(row.canonical_name, row.sample_id);
+                    } else {
+                        ambiguousInDb.add(row.canonical_name);
+                    }
                 }
             }
-            log.debug('Batch-resolved unresolved relation targets', {
+            log.debug('Batch-resolved unambiguous relation targets', {
                 unresolved: unresolvedTargets.size,
                 resolved: resolvedFromDb.size,
+                ambiguous: ambiguousInDb.size,
             });
         }
 
-        // Second pass: build relation insert statements using all resolution sources
+        // Second pass: build relation insert statements, skipping ambiguous edges.
         let persisted = 0;
         let sourceFailures = 0;
         let targetFailures = 0;
+        let ambiguousDrops = 0;
         const statements: { text: string; params: unknown[] }[] = [];
 
         for (const rel of rawRelations) {
@@ -95,13 +121,16 @@ export class StructuralGraphEngine {
                 continue;
             }
 
-            // Target resolution: stable_key → canonical name → batch-resolved DB
-            const dstSvId = svByKey.get(rel.target_name)
-                         || svByCanonical.get(rel.target_name)
-                         || resolvedFromDb.get(rel.target_name);
+            const inMemory = resolveInMemory(rel.target_name);
+            const dstSvId = inMemory ?? resolvedFromDb.get(rel.target_name);
 
             if (!dstSvId) {
-                targetFailures++;
+                const memoryCount = svByCanonical.get(rel.target_name)?.length ?? 0;
+                if (memoryCount > 1 || ambiguousInDb.has(rel.target_name)) {
+                    ambiguousDrops++;
+                } else {
+                    targetFailures++;
+                }
                 continue;
             }
 
@@ -115,10 +144,10 @@ export class StructuralGraphEngine {
             persisted++;
         }
 
-        if (sourceFailures > 0 || targetFailures > 0) {
+        if (sourceFailures > 0 || targetFailures > 0 || ambiguousDrops > 0) {
             log.info('Relation resolution summary', {
                 total: rawRelations.length, persisted,
-                sourceFailures, targetFailures,
+                sourceFailures, targetFailures, ambiguousDrops,
             });
         }
 

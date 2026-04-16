@@ -161,11 +161,16 @@ async function benchOne(target: { symbol_version_id: string; name: string; file_
 
 async function main() {
     const N = parseInt(process.argv[2] || '8', 10);
+    // The snapshot to benchmark against comes from the repo whose root we
+    // pointed REPO at — find its most recent snapshot. Fall back to
+    // anything starting with "ContextZero-bench" for backward compat.
+    const repoBase = path.basename(REPO);
     const snap = await db.query(`
         SELECT s.snapshot_id FROM snapshots s JOIN repositories r ON r.repo_id=s.repo_id
-        WHERE r.name LIKE $1 ORDER BY s.indexed_at DESC LIMIT 1
-    `, ['ContextZero-bench%']);
-    if (snap.rowCount === 0) { console.error('no snapshot'); process.exit(1); }
+        WHERE r.name LIKE $1 OR r.name LIKE $2
+        ORDER BY s.indexed_at DESC LIMIT 1
+    `, [`${repoBase}%`, 'ContextZero-bench%']);
+    if (snap.rowCount === 0) { console.error(`no snapshot matching "${repoBase}%"`); process.exit(1); }
     const snapshotId = (snap.rows[0] as { snapshot_id: string }).snapshot_id;
     console.log(`[bench] snapshot=${snapshotId}  N=${N}`);
 
