@@ -933,16 +933,21 @@ export class TemporalEngine {
             symbolToSv.set(row.symbol_id, row.symbol_version_id);
         }
 
-        // Create an evidence bundle for co-change relations
-        const evidenceBundleId = uuidv4();
-        await db.query(`
+        // Upsert-or-fetch the shared co-change evidence bundle. The score tuple
+        // (0, 0, 0, 0, 0, 1.0) is a fingerprint for "temporal co-change" and is
+        // unique via uq_evidence_bundle_scores — so every run reuses the same
+        // bundle instead of trying to insert a fresh UUID that conflicts.
+        const bundleResult = await db.query(`
             INSERT INTO evidence_bundles
                 (evidence_bundle_id, semantic_score, structural_score,
                  behavioral_score, contract_score, test_score, history_score,
                  contradiction_flags, feature_payload)
             VALUES ($1, 0, 0, 0, 0, 0, 1.0, '{}', '{"source": "temporal_co_change"}')
-            ON CONFLICT (evidence_bundle_id) DO NOTHING
-        `, [evidenceBundleId]);
+            ON CONFLICT ON CONSTRAINT uq_evidence_bundle_scores DO UPDATE
+                SET feature_payload = evidence_bundles.feature_payload
+            RETURNING evidence_bundle_id
+        `, [uuidv4()]);
+        const evidenceBundleId = (bundleResult.rows[0] as { evidence_bundle_id: string }).evidence_bundle_id;
 
         let created = 0;
         let batch: { text: string; params: unknown[] }[] = [];
