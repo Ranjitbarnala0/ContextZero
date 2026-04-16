@@ -203,7 +203,7 @@ let workspaceContext: WorkspaceContext | null = null;
 async function findGitRoot(startDir: string): Promise<string | null> {
     let dir = path.resolve(startDir);
     const root = path.parse(dir).root;
-    while (true) {
+    for (;;) {
         try {
             await fs.access(path.join(dir, '.git'));
             return dir;
