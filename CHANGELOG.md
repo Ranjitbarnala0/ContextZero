@@ -5,6 +5,56 @@ All notable changes to ContextZero are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0]
+
+### Added
+
+- **Nested symbol extraction across all tree-sitter languages.** The
+  universal adapter walker now descends into function bodies and resolves
+  class-body containers by child type in addition to field name. Anonymous
+  object method overrides — a common Kotlin pattern for listeners — are
+  captured as first-class symbols with the enclosing class as parent.
+  Kotlin property declarations resolve the identifier through the
+  `variable_declaration` wrapper. Class-body functions are classified as
+  `method` across every supported language. Measured on a 66-file Kotlin
+  project: 566 symbols (235 methods, 171 properties, 88 classes, 72
+  top-level functions) and 113 behavior hints.
+
+- **Behavioral fingerprint gating for concept families.** The naming-pattern
+  clustering step loads behavioral profiles and sub-buckets each suffix
+  group by purity class and effect-set before forming families. Members
+  within a family share compatible behavioral shape, eliminating
+  false-positive groupings driven purely by name similarity. ContextZero
+  self-ingest produces nine coherent families after this change.
+
+### Changed
+
+- **Call-graph edges are precise by default.** The TypeScript adapter
+  emits only full call chains (`db.query`); the structural graph engine
+  treats canonical names as a multi-map and drops ambiguous matches
+  rather than resolving to an arbitrary candidate. Precise dispatch
+  resolution remains the responsibility of the points-to analyzer. As a
+  result, transitive behavioral propagation is tight: 27 `side_effecting`
+  functions and 179 `read_only` functions on ContextZero's own codebase.
+
+- **Benchmark documentation.** The README reports the median and
+  p25–p90 distribution from `scripts/bench-head-to-head.ts` alongside
+  three representative per-symbol comparisons. The reproduction
+  invocation is documented next to the numbers.
+
+- **Claude Code setup.** The MCP registration example uses
+  `claude mcp add-json` for reliability with multi-env, subprocess-based
+  stdio servers.
+
+### Known limits
+
+- Behavioral pattern matching does not yet detect SQL built via template
+  literals or variable interpolation. Functions that build queries this
+  way may report a lower purity class than the runtime behavior implies.
+  The capability is tracked for a future release.
+
+---
+
 ## [2.2.0] — Production-Ready Launch
 
 ### Fixed

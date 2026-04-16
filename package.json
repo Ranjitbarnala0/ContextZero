@@ -1,6 +1,6 @@
 {
   "name": "scg-v2",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "ContextZero — Production-grade code cognition and change orchestration system",
   "main": "dist/mcp-interface/index.js",
   "engines": {
