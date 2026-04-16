@@ -131,6 +131,19 @@ const LOCALHOST_HOSTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * A host is "local" if it is loopback, OR is a Unix domain socket path
+ * (node-postgres treats DB_HOST values that start with "/" as socket directories).
+ * Unix sockets cannot carry TLS and are inherently local, so SSL is neither
+ * possible nor required.
+ */
+function isLocalHost(host: string): boolean {
+    if (LOCALHOST_HOSTS.has(host)) return true;
+    // Unix domain socket directory (e.g. /var/run/postgresql, /tmp).
+    if (host.startsWith('/')) return true;
+    return false;
+}
+
+/**
  * Build the SSL/TLS configuration object based on environment variables.
  *
  * Environment variables consumed:
@@ -156,7 +169,7 @@ function buildSslConfig(host: string): false | tls.ConnectionOptions {
         });
     }
 
-    const isRemoteHost = !LOCALHOST_HOSTS.has(host);
+    const isRemoteHost = !isLocalHost(host);
 
     // --- Production safety checks ---------------------------------------------------
     if (isProduction()) {

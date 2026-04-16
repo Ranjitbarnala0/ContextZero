@@ -1,21 +1,19 @@
-version: "3.9"
-
 services:
   # ──────────── PostgreSQL ────────────
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: scg_v2
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${DB_NAME:-scg_v2}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env before starting}
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d scg_v2"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-scg_v2}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -28,19 +26,26 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "3100:3100"
+      - "${SCG_PORT:-3100}:3100"
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_NAME: scg_v2
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_NAME: ${DB_NAME:-scg_v2}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env before starting}
+      DB_SSL_MODE: disable
       DB_MAX_CONNECTIONS: 20
       SCG_PORT: 3100
       SCG_HOST: 0.0.0.0
       SCG_API_KEYS: ${SCG_API_KEYS:?Set SCG_API_KEYS in .env before starting}
-      LOG_LEVEL: info
-      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV: ${NODE_ENV:-production}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3100/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   pgdata:

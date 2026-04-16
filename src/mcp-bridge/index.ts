@@ -14,10 +14,12 @@
  *   { "command": "node", "args": ["dist/mcp-bridge/index.js"] }
  */
 
+import * as crypto from 'crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as path from 'path';
+import * as fs from 'fs/promises';
 import { db } from '../db-driver';
 import { destroyAllCaches } from '../cache';
 import { runPendingMigrations } from '../db-driver/migrate';
@@ -180,6 +182,165 @@ const rateLimiters: Record<string, McpRateLimiter> = {
     scg_find_concept: new McpRateLimiter(60 * 1000, 30),             // 30 per minute
 };
 
+// ────────── Workspace Context ──────────
+//
+// When a workspace is active, tools can omit repo_id and snapshot_id.
+// The bridge auto-discovers the workspace on startup from:
+//   1. CZ_WORKSPACE_PATH env var (set by MCP client config or .claude/settings.json)
+//   2. process.cwd() — walk up to find git root (works when launched from project dir)
+// Auto-registers and auto-ingests the workspace so tools work immediately.
+
+interface WorkspaceContext {
+    repoId: string;
+    snapshotId: string;
+    repoPath: string;
+    repoName: string;
+}
+
+let workspaceContext: WorkspaceContext | null = null;
+
+/** Walk up from startDir to find the nearest .git root. Returns null if none found. */
+async function findGitRoot(startDir: string): Promise<string | null> {
+    let dir = path.resolve(startDir);
+    const root = path.parse(dir).root;
+    for (;;) {
+        try {
+            await fs.access(path.join(dir, '.git'));
+            return dir;
+        } catch {
+            const parent = path.dirname(dir);
+            if (parent === dir || parent === root) return null;
+            dir = parent;
+        }
+    }
+}
+
+/** Discover the workspace path from env or cwd. */
+async function discoverWorkspace(): Promise<string | null> {
+    const envPath = process.env.CZ_WORKSPACE_PATH?.trim();
+    if (envPath) {
+        try {
+            await fs.access(envPath);
+            return path.resolve(envPath);
+        } catch {
+            log.warn('CZ_WORKSPACE_PATH is set but not accessible', { path: envPath });
+        }
+    }
+
+    const cwd = process.cwd();
+    const gitRoot = await findGitRoot(cwd);
+    if (gitRoot) return gitRoot;
+
+    // No git root found — use cwd if it looks like a project (has package.json, Cargo.toml, etc.)
+    const markers = ['package.json', 'Cargo.toml', 'pyproject.toml', 'go.mod', 'Makefile', 'pom.xml', 'build.gradle'];
+    for (const marker of markers) {
+        try {
+            await fs.access(path.join(cwd, marker));
+            return cwd;
+        } catch { /* continue */ }
+    }
+
+    return null;
+}
+
+/**
+ * Initialize workspace context: register, ingest if needed, resolve snapshot.
+ * On first launch (no existing snapshot), runs full ingestion inline.
+ * On subsequent launches, uses existing snapshot and kicks off incremental re-index.
+ */
+async function initializeWorkspace(): Promise<void> {
+    const workspacePath = await discoverWorkspace();
+    if (!workspacePath) {
+        log.info('No workspace discovered — tools will require explicit repo_id/snapshot_id');
+        return;
+    }
+
+    const name = path.basename(workspacePath);
+    log.info('Workspace discovered', { path: workspacePath, name });
+
+    // Register the repo (idempotent — returns existing repo_id if already registered)
+    const regResult = await handleRegisterRepo({ repo_name: name, repo_path: workspacePath }, log);
+    const regText = regResult?.content?.[0]?.text;
+    if (!regText || regResult.isError) {
+        log.warn('Workspace registration failed', { result: regText });
+        return;
+    }
+
+    const regData = JSON.parse(regText);
+    const repoId = regData.repo_id;
+    if (!repoId) {
+        log.warn('Workspace registration returned no repo_id', { result: regText });
+        return;
+    }
+
+    // Check for existing snapshot
+    const snapResult = await handleListSnapshots({ repo_id: repoId, limit: 1 }, log);
+    const snapText = snapResult?.content?.[0]?.text;
+    let snapshotId: string | null = null;
+
+    if (snapText && !snapResult.isError) {
+        const snapData = JSON.parse(snapText);
+        const snapshots = Array.isArray(snapData) ? snapData : snapData.snapshots ?? [];
+        if (snapshots.length > 0 && snapshots[0].snapshot_id) {
+            snapshotId = snapshots[0].snapshot_id;
+        }
+    }
+
+    if (snapshotId) {
+        // Existing snapshot — workspace is ready immediately
+        workspaceContext = { repoId, snapshotId, repoPath: workspacePath, repoName: name };
+        log.info('Workspace ready (existing snapshot)', {
+            repo_id: repoId, snapshot_id: snapshotId, path: workspacePath,
+        });
+
+        // Kick off incremental re-index in background (non-blocking)
+        handleIngestRepo({ repo_id: repoId }, log).then(() => {
+            // Update snapshot after re-index completes
+            handleListSnapshots({ repo_id: repoId, limit: 1 }, log).then(snap => {
+                const txt = snap?.content?.[0]?.text;
+                if (txt && !snap.isError) {
+                    try {
+                        const d = JSON.parse(txt);
+                        const ss = Array.isArray(d) ? d : d.snapshots ?? [];
+                        if (ss.length > 0 && ss[0].snapshot_id && workspaceContext) {
+                            workspaceContext.snapshotId = ss[0].snapshot_id;
+                            log.info('Workspace snapshot updated after re-index', { snapshot_id: ss[0].snapshot_id });
+                        }
+                    } catch (parseErr) {
+                        log.warn('Failed to parse snapshot response after re-index', { error: parseErr instanceof Error ? parseErr.message : String(parseErr) });
+                    }
+                }
+            }).catch(snapErr => {
+                log.warn('Background snapshot refresh failed', { error: snapErr instanceof Error ? snapErr.message : String(snapErr) });
+            });
+        }).catch(err => {
+            log.warn('Background workspace re-index failed', { error: err instanceof Error ? err.message : String(err) });
+        });
+    } else {
+        // First time — need to ingest before workspace is usable
+        log.info('First-time workspace ingestion starting', { repo_id: repoId, path: workspacePath });
+        await handleIngestRepo({ repo_id: repoId }, log);
+
+        const freshSnap = await handleListSnapshots({ repo_id: repoId, limit: 1 }, log);
+        const freshText = freshSnap?.content?.[0]?.text;
+        if (freshText && !freshSnap.isError) {
+            const freshData = JSON.parse(freshText);
+            const snapshots = Array.isArray(freshData) ? freshData : freshData.snapshots ?? [];
+            if (snapshots.length > 0 && snapshots[0].snapshot_id) {
+                snapshotId = snapshots[0].snapshot_id as string;
+                workspaceContext = { repoId, snapshotId: snapshotId!, repoPath: workspacePath, repoName: name };
+                log.info('Workspace ready (first ingestion complete)', {
+                    repo_id: repoId, snapshot_id: snapshotId, path: workspacePath,
+                });
+            }
+        }
+
+        if (!snapshotId) {
+            log.warn('Workspace ingestion completed but no snapshot was created');
+        }
+    }
+}
+
 // ────────── MCP Result Type ──────────
 
 interface McpTextContent {
@@ -202,7 +363,13 @@ type ToolHandler = (args: Record<string, unknown>, log: McpLogger) => Promise<Mc
 function safeTool(handler: ToolHandler): (args: Record<string, unknown>) => Promise<McpCallToolResult> {
     return async (args: Record<string, unknown>) => {
         try {
-            return await handler(args, log);
+            const result = await Promise.race([
+                handler(args, log),
+                new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error('Tool execution timeout (60s)')), 60000)
+                ),
+            ]);
+            return result;
         } catch (err: unknown) {
             const rawMessage = err instanceof Error ? err.message : String(err);
             log.error('Tool execution failed', err);
@@ -263,6 +430,11 @@ interface McpToolResult {
 
 type McpToolHandler = (args: Record<string, unknown>) => Promise<McpToolResult>;
 
+function constantTimeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 function registerTool(name: string, config: McpToolConfig, handler: McpToolHandler): void {
     // Wrap the handler to inject tool-name-aware auth + rate limiting
     const wrappedHandler: McpToolHandler = async (args: Record<string, unknown>) => {
@@ -271,7 +443,7 @@ function registerTool(name: string, config: McpToolConfig, handler: McpToolHandl
             const token = args['_auth_token'];
             const cleanArgs = { ...args };
             delete cleanArgs['_auth_token'];
-            if (token !== MCP_SECRET) {
+            if (!constantTimeEqual(String(token ?? ''), MCP_SECRET)) {
                 log.warn('Authentication failed for tool call', { tool: name });
                 return {
                     content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Authentication failed: invalid or missing _auth_token' }) }],
@@ -279,6 +451,16 @@ function registerTool(name: string, config: McpToolConfig, handler: McpToolHandl
                 };
             }
             args = cleanArgs;
+        }
+
+        // ── Workspace default injection ──
+        // When a workspace is active, auto-fill repo_id and snapshot_id
+        // so tools work without requiring explicit UUIDs from the AI agent.
+        if (workspaceContext) {
+            const defaults: Record<string, string> = {};
+            if (args['repo_id'] === undefined) defaults.repo_id = workspaceContext.repoId;
+            if (args['snapshot_id'] === undefined) defaults.snapshot_id = workspaceContext.snapshotId;
+            if (Object.keys(defaults).length > 0) args = { ...args, ...defaults };
         }
 
         // ── Rate-limit gate ──
@@ -1213,6 +1395,15 @@ async function main(): Promise<void> {
             'pg_trgm extension is missing — homolog similarity searches will fail. ' +
             'Install it with: CREATE EXTENSION IF NOT EXISTS pg_trgm;'
         );
+    }
+
+    // ── Auto-discover and register workspace ──
+    // This makes all tools work immediately for AI agents — no manual repo_id/snapshot_id needed.
+    try {
+        await initializeWorkspace();
+    } catch (err) {
+        log.warn('Workspace auto-discovery failed — tools will require explicit IDs',
+            { error: err instanceof Error ? err.message : String(err) });
     }
 
     // Periodic health logging — detect DB issues between tool calls

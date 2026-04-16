@@ -168,6 +168,7 @@ class DatabaseDriver {
     private readonly slowQueryMs: number;
     private readonly circuit: CircuitBreaker;
     private readonly maxWaitingQueries: number;
+    private lastPoolPressureWarn = 0;
     private closed = false;
 
     private constructor() {
@@ -243,11 +244,15 @@ class DatabaseDriver {
         }
 
         if (this.pool.waitingCount > 0) {
-            log.warn('Pool pressure: queries waiting for connections', {
-                waitingCount: this.pool.waitingCount,
-                totalCount: this.pool.totalCount,
-                idleCount: this.pool.idleCount,
-            });
+            const now = Date.now();
+            if (now - this.lastPoolPressureWarn >= 5_000) {
+                this.lastPoolPressureWarn = now;
+                log.warn('Pool pressure: queries waiting for connections', {
+                    waitingCount: this.pool.waitingCount,
+                    totalCount: this.pool.totalCount,
+                    idleCount: this.pool.idleCount,
+                });
+            }
         }
 
         return withRetry(

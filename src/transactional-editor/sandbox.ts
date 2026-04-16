@@ -241,12 +241,19 @@ export async function sandboxExec(
         let spawnArgs = args;
 
         if (process.platform === 'linux') {
+            // Each ulimit is wrapped in a subshell that silently ignores failures.
+            // Some systems restrict certain ulimit flags (e.g., -u requires
+            // appropriate privileges, -v may not be supported on all kernels).
+            // Using `(ulimit ... 2>/dev/null || true)` ensures the sandbox
+            // starts even when specific limits can't be applied.
+            const safeUlimit = (flag: string, value: number) =>
+                `(ulimit ${flag} ${Math.floor(value)} 2>/dev/null || true)`;
             const ulimitPrefix = [
-                `ulimit -v ${Math.floor(limits.maxMemoryMb * 1024)}`,    // virtual memory in KB
-                `ulimit -t ${Math.floor(limits.maxCpuSeconds)}`,          // CPU time in seconds
-                `ulimit -u ${Math.floor(limits.maxProcesses)}`,           // max user processes
-                `ulimit -f ${Math.floor(limits.maxFileSizeMb * 1024)}`,   // file size in KB
-                `ulimit -n ${Math.floor(limits.maxOpenFiles)}`,           // open file descriptors
+                safeUlimit('-v', limits.maxMemoryMb * 1024),    // virtual memory in KB
+                safeUlimit('-t', limits.maxCpuSeconds),          // CPU time in seconds
+                safeUlimit('-u', limits.maxProcesses),           // max user processes
+                safeUlimit('-f', limits.maxFileSizeMb * 1024),   // file size in KB
+                safeUlimit('-n', limits.maxOpenFiles),           // open file descriptors
             ].join(' && ');
 
             // Wrap: sh -c "ulimit ... && exec <original command>"

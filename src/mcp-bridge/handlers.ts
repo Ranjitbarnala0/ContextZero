@@ -1,9 +1,11 @@
 /**
  * ContextZero — MCP Bridge Tool Handlers
  *
- * Direct-call implementations for all 49 ContextZero tools, executing engine
+ * Direct-call implementations for ContextZero tools, executing engine
  * code without HTTP overhead. Each handler mirrors the logic from the REST API
  * but returns structured MCP CallToolResult payloads.
+ *
+ * ContextZero tool handlers — count is tracked dynamically by the bridge
  *
  * All handlers follow the pattern:
  *   (args) => Promise<CallToolResult>
@@ -99,8 +101,16 @@ interface CallToolResult {
 
 /** Standard MCP text result */
 function textResult(data: unknown): CallToolResult {
+    const json = JSON.stringify(data);
+    if (json.length > 1_000_000) {
+        // Truncate oversized responses to prevent stdout buffer overflow
+        const truncated = json.substring(0, 1_000_000);
+        return {
+            content: [{ type: 'text' as const, text: truncated + '\n... [truncated: response exceeded 1MB limit]' }],
+        };
+    }
     return {
-        content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: 'text' as const, text: json }],
     };
 }
 
@@ -631,6 +641,9 @@ export async function handleRegisterRepo(args: Record<string, unknown>, log: Mcp
         });
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes('not a git repository')) {
+            return errorResult('Directory exists but is not a git repository (no .git found). Initialize with `git init` first.');
+        }
         if (msg.includes('ENOENT') || msg.includes('EACCES') || msg.includes('not within allowed')) {
             return errorResult('Repository path is not accessible or not within allowed base paths');
         }
@@ -705,6 +718,9 @@ export async function handleIngestRepo(args: Record<string, unknown>, log: McpLo
             });
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
+            if (msg.includes('not a git repository')) {
+                return errorResult('Directory exists but is not a git repository (no .git found). Initialize with `git init` first.');
+            }
             if (msg.includes('ENOENT') || msg.includes('EACCES') || msg.includes('not within allowed')) {
                 return errorResult('Repository path is not accessible or not within allowed base paths');
             }

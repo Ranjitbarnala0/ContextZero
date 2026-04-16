@@ -7,10 +7,19 @@
  */
 
 const mockQuery = jest.fn();
+const mockClientQuery = jest.fn();
+const mockClientRelease = jest.fn();
+const mockPoolConnect = jest.fn(async () => ({
+    query: (...args: unknown[]) => mockClientQuery(...args),
+    release: mockClientRelease,
+}));
 
 jest.mock('../db-driver', () => ({
     db: {
         query: (...args: unknown[]) => mockQuery(...args),
+        pool: {
+            connect: (...args: unknown[]) => mockPoolConnect(...args),
+        },
     },
 }));
 
@@ -47,6 +56,8 @@ import {
 
 beforeEach(() => {
     mockQuery.mockReset();
+    mockClientQuery.mockReset();
+    mockClientRelease.mockReset();
 });
 
 // ────────── cleanupExpiredSnapshots ──────────
@@ -138,28 +149,34 @@ describe('cleanupStaleTransactions', () => {
 
 describe('cleanupOrphanedData', () => {
     it('cleans orphaned evidence bundles and terminal backups', async () => {
+        // BEGIN
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         // Evidence bundles DELETE
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 3 });
         // Transaction file backups DELETE
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 7 });
+        // COMMIT
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         // Audit log INSERT
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
         const count = await cleanupOrphanedData();
 
         expect(count).toBe(10);
-        expect(mockQuery).toHaveBeenCalledTimes(3);
+        expect(mockQuery).toHaveBeenCalledTimes(5);
     });
 
     it('returns 0 when no orphans found', async () => {
+        // BEGIN, DELETE(0), DELETE(0), COMMIT — no audit log since nothing cleaned
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
         const count = await cleanupOrphanedData();
 
         expect(count).toBe(0);
-        // No audit log (only 2 DELETE queries)
-        expect(mockQuery).toHaveBeenCalledTimes(2);
+        expect(mockQuery).toHaveBeenCalledTimes(4);
     });
 });
 
@@ -167,50 +184,57 @@ describe('cleanupOrphanedData', () => {
 
 describe('runRetentionPolicy', () => {
     it('acquires advisory lock, runs all phases, releases lock', async () => {
-        // Advisory lock acquisition
-        mockQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 });
+        // Advisory lock acquisition (on dedicated client)
+        mockClientQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 });
 
-        // Phase 1: cleanupStaleTransactions
+        // Phase 1: cleanupStaleTransactions — 1 UPDATE
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
-        // Phase 2: cleanupExpiredSnapshots (stamp + delete)
-        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
-        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
-
-        // Phase 3: enforceSnapshotCap
-        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
-
-        // Phase 4: cleanupOrphanedData (2 queries)
+        // Phase 2: cleanupExpiredSnapshots — stamp UPDATE + delete DELETE
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
-        // Advisory lock release
+        // Phase 3: enforceSnapshotCap — 1 DELETE
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+        // Phase 4: cleanupOrphanedData — BEGIN, DELETE, DELETE, COMMIT
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+        // Advisory lock release (on dedicated client)
+        mockClientQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
         const result = await runRetentionPolicy();
 
         expect(result.errors).toHaveLength(0);
         expect(result.durationMs).toBeGreaterThanOrEqual(0);
-        // Verify lock acquired first
-        expect(mockQuery.mock.calls[0][0]).toContain('pg_try_advisory_lock');
-        // Verify lock released last
-        const lastCall = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+        // Verify lock acquired first on the client
+        expect(mockClientQuery.mock.calls[0][0]).toContain('pg_try_advisory_lock');
+        // Verify lock released last on the client
+        const lastCall = mockClientQuery.mock.calls[mockClientQuery.mock.calls.length - 1];
         expect(lastCall[0]).toContain('pg_advisory_unlock');
+        // Client must be released back to the pool
+        expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('returns early if lock not acquired', async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [{ acquired: false }], rowCount: 1 });
+        mockClientQuery.mockResolvedValueOnce({ rows: [{ acquired: false }], rowCount: 1 });
 
         const result = await runRetentionPolicy();
 
         expect(result.errors).toHaveLength(1);
         expect(result.errors[0]).toContain('Lock not acquired');
-        expect(mockQuery).toHaveBeenCalledTimes(1);
+        // Only the lock query should have run on the client; no phase queries on the pool.
+        expect(mockClientQuery).toHaveBeenCalledTimes(1);
+        expect(mockQuery).toHaveBeenCalledTimes(0);
+        expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 
     it('isolates phase errors — failure in one does not abort others', async () => {
-        // Lock acquired
-        mockQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 });
+        // Lock acquired on client
+        mockClientQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 });
 
         // Phase 1: stale cleanup FAILS
         mockQuery.mockRejectedValueOnce(new Error('DB timeout'));
@@ -222,20 +246,23 @@ describe('runRetentionPolicy', () => {
         // Phase 3: snapshot cap succeeds
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
-        // Phase 4: orphan cleanup succeeds
+        // Phase 4: orphan cleanup succeeds — BEGIN, DELETE, DELETE, COMMIT
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
         mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
-        // Lock release
-        mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+        // Lock release on client
+        mockClientQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
 
         const result = await runRetentionPolicy();
 
         expect(result.errors).toHaveLength(1);
         expect(result.errors[0]).toContain('stale_transactions');
-        // All other phases still ran (lock released)
-        const lastCall = mockQuery.mock.calls[mockQuery.mock.calls.length - 1];
+        // Lock released last on client
+        const lastCall = mockClientQuery.mock.calls[mockClientQuery.mock.calls.length - 1];
         expect(lastCall[0]).toContain('pg_advisory_unlock');
+        expect(mockClientRelease).toHaveBeenCalledTimes(1);
     });
 });
 
