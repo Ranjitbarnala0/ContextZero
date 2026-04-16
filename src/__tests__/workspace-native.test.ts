@@ -30,6 +30,8 @@ describe('workspace-native utilities', () => {
     test('enforces allowed base paths for raw workspace access', async () => {
         const repoRoot = path.join(tempRoot, 'repo');
         fs.mkdirSync(repoRoot, { recursive: true });
+        // ensureAllowedRepoPath requires the directory to be a git repo.
+        fs.mkdirSync(path.join(repoRoot, '.git'), { recursive: true });
 
         await expect(ensureAllowedRepoPath(repoRoot)).resolves.toBe(fs.realpathSync(repoRoot));
         await expect(ensureAllowedRepoPath(os.tmpdir())).rejects.toThrow(/Allowed base path violation/);
