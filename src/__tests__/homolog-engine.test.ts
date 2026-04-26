@@ -197,7 +197,17 @@ beforeEach(() => {
         const fakeClient = {};
         return cb(fakeClient);
     });
-    mockDbQueryWithClient.mockResolvedValue(emptyResult());
+    // Default: INSERT ... RETURNING evidence_bundle_id returns the bundleId from $1.
+    // Both bundle and inferred_relation INSERTs use this default.
+    mockDbQueryWithClient.mockImplementation((_client: unknown, sql: string, params: unknown[]) => {
+        if (sql.includes('INTO evidence_bundles') && sql.includes('RETURNING')) {
+            return Promise.resolve({
+                rows: [{ evidence_bundle_id: params[0] }],
+                rowCount: 1, command: 'INSERT', oid: 0, fields: [],
+            });
+        }
+        return Promise.resolve(emptyResult());
+    });
 });
 
 // =====================================================================

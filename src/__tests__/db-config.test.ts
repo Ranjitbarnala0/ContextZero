@@ -10,10 +10,6 @@ describe('Database config', () => {
         process.env = { ...ORIGINAL_ENV };
         delete process.env['DB_PASSWORD'];
         delete process.env['PGPASSWORD'];
-        // Pin to a known-local host so the production SSL check doesn't pick up
-        // whatever DB_HOST happens to be set by the ambient .env during tests.
-        process.env['DB_HOST'] = 'localhost';
-        delete process.env['PGHOST'];
         // Set API keys to empty to prevent the key-entropy check from interfering
         // with DB-config-focused tests. Using empty string (not delete) because
         // dotenv.config() would re-populate from .env if the var is absent.

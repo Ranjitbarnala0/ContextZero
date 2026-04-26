@@ -4,15 +4,20 @@
 -- 2. Composite index on snapshots for retention age queries
 -- 3. Partial index on symbol_lineage for active lineage queries
 -- 4. Covering index on cleanup_log for recent-run lookups
+--
+-- NOTE: temporal tables use distinct timestamp columns by design:
+--   temporal_co_changes  → computed_at  (recomputed periodically)
+--   temporal_risk_scores → computed_at  (recomputed periodically)
+--   runtime_observed_edges → first_observed (when the edge was first seen)
+--   runtime_traces        → created_at   (when the trace was ingested)
+-- A previous on-disk version of this migration uniformly used `created_at`,
+-- which would fail on a fresh DB because three of these tables have no such
+-- column. The DDL below matches the columns that exist in production.
 
 -- ─── BRIN Indexes for Temporal Tables ────────────────────────────────────────
 -- BRIN (Block Range INdex) is ideal for append-only temporal data where
 -- physical ordering correlates with logical ordering. Much smaller than B-tree
 -- while supporting range scans efficiently.
-
--- NOTE: each temporal table has its own insertion-ordered timestamp column
--- (computed_at / first_observed / created_at). They are all NOT NULL and
--- populated at INSERT time, so BRIN works on all of them.
 
 CREATE INDEX IF NOT EXISTS idx_temporal_co_changes_computed_brin
     ON temporal_co_changes USING brin (computed_at)

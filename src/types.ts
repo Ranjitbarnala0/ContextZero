@@ -42,10 +42,9 @@ export type CapsuleMode = 'minimal' | 'standard' | 'strict';
 export type RelationSource = 'static_analysis' | 'runtime_trace' | 'heuristic' | 'manual';
 export type RelationProvenance = 'static_exact' | 'static_inferred' | 'runtime_observed' | 'framework_declared' | 'developer_asserted';
 export type InvariantSourceType = 'explicit_test' | 'derived' | 'manual' | 'assertion' | 'schema' | 'guard_clause' | 'type_constraint' | 'pattern' | 'cross_symbol';
-export type EffectClass = 'pure' | 'reader' | 'writer' | 'io' | 'full_side_effect';
-export type DispatchResolutionMethod = 'type_annotation' | 'constructor_assignment' | 'field_inference' | 'inheritance_mro' | 'runtime_observed' | 'unresolved';
 export type TraceSource = 'test_execution' | 'dev_run' | 'ci_trace' | 'production_sample';
-export type ConceptFamilyType = 'validator' | 'serializer' | 'auth_policy' | 'normalization' | 'billing_rule' | 'feature_gate' | 'error_handler' | 'query_builder' | 'business_rule' | 'custom';
+// EffectClass / DispatchResolutionMethod / ConceptFamilyType are owned by their
+// respective engines (analysis-engine/{effect-engine,dispatch-resolver,concept-families}.ts).
 export type ContextResolution = 'full_source' | 'signature_only' | 'contract_summary' | 'effect_summary' | 'name_only';
 export type InvariantScopeLevel = 'global' | 'module' | 'symbol';
 
@@ -248,7 +247,7 @@ export interface ContextCapsule {
     fetch_handles?: FetchHandle[];
     dispatch_context?: DispatchContextNode[];
     family_context?: FamilyContextNode[];
-    effect_signature?: EffectEntry[];
+    effect_signature?: CapsuleEffectSummary[];
     inclusion_rationale?: InclusionRationale[];
     compilation_id?: string;
 }
@@ -416,48 +415,21 @@ export interface SymbolLineage {
     updated_at: Date;
 }
 
-export interface LineageResult {
-    total_symbols: number;
-    new_lineages: number;
-    matched_lineages: number;
-    renamed_lineages: number;
-    dead_lineages: number;
-}
-
-export interface RenameMatch {
-    old_lineage_id: string;
-    new_symbol_id: string;
-    old_name: string;
-    new_name: string;
-    confidence: number;
-    match_method: string;
-}
-
-// DISPATCH RESOLUTION
-
-export interface DispatchEdge {
-    dispatch_edge_id: string;
-    snapshot_id: string;
-    caller_symbol_version_id: string;
-    receiver_expression: string;
-    receiver_types: string[];
-    resolved_symbol_version_ids: string[];
-    resolution_method: DispatchResolutionMethod;
-    confidence: number;
-    is_polymorphic: boolean;
-    class_hierarchy_depth: number | null;
-    override_chain: string[] | null;
-}
-
-export interface DispatchResolution {
-    resolved: boolean;
-    target_symbol_version_ids: string[];
-    receiver_type: string | null;
-    resolution_method: DispatchResolutionMethod;
-    confidence: number;
-    is_polymorphic: boolean;
-    chain_segments: { expression: string; resolved_type: string | null }[];
-}
+// Engine-owned shapes — see source modules for canonical definitions:
+//   LineageResult, RenameMatch          → src/analysis-engine/symbol-lineage.ts
+//   DispatchEdge, DispatchResolution    → src/analysis-engine/dispatch-resolver.ts
+//   ClassHierarchyEntry                 → kept below (single declaration site)
+//   EffectEntry, EffectSignature, EffectDiff
+//                                       → src/analysis-engine/effect-engine.ts
+//   ConceptFamily, ConceptFamilyMember, FamilyBuildResult
+//                                       → src/analysis-engine/concept-families.ts
+//   TemporalRiskScore, CoChangePartner, TemporalResult, GitCommit
+//                                       → src/analysis-engine/temporal-engine.ts
+// These previously had near-duplicate declarations here that drifted in field
+// names from the engines (e.g. `outliers_detected` vs `total_outliers`,
+// `hash` vs `sha`). Zero external consumers imported the duplicates from this
+// file, so they have been removed to keep the engines as the single source of
+// truth. Import directly from the engine module if you need a shape.
 
 export interface ClassHierarchyEntry {
     hierarchy_id: string;
@@ -468,118 +440,17 @@ export interface ClassHierarchyEntry {
     relation_kind: 'extends' | 'implements' | 'mixin' | 'protocol';
 }
 
-// EFFECT SIGNATURES
-
-export interface EffectEntry {
-    kind: 'reads' | 'writes' | 'emits' | 'calls_external' | 'mutates'
-        | 'requires' | 'throws' | 'opens' | 'normalizes' | 'acquires_lock' | 'logs';
-    /** Domain key — resource path, event name, error type, etc. */
+/**
+ * Structural shape used by ContextCapsule.effect_signature. Kept as a leaf
+ * type here so types.ts has no inbound dependency on analysis-engine; the
+ * effect engine's full EffectEntry is a structural subtype of this and can
+ * be passed in directly.
+ */
+export interface CapsuleEffectSummary {
+    kind: string;
     descriptor: string;
     detail: string;
-    /** Whether this effect was observed directly or propagated from a callee */
     provenance?: 'direct' | 'transitive';
-    /** @deprecated Use `descriptor` — kept for backwards compatibility in API responses */
-    resource?: string;
-}
-
-export interface EffectSignature {
-    effect_signature_id: string;
-    symbol_version_id: string;
-    effects: EffectEntry[];
-    effect_class: EffectClass;
-    reads_resources: string[];
-    writes_resources: string[];
-    emits_events: string[];
-    calls_external: string[];
-    mutates_state: string[];
-    requires_auth: string[];
-    throws_errors: string[];
-    source: string;
-    confidence: number;
-}
-
-export interface EffectDiff {
-    added_effects: EffectEntry[];
-    removed_effects: EffectEntry[];
-    changed_class: { before: EffectClass; after: EffectClass } | null;
-    escalated: boolean;
-    new_resources: string[];
-    removed_resources: string[];
-}
-
-// CONCEPT FAMILIES
-
-export interface ConceptFamily {
-    family_id: string;
-    repo_id: string;
-    snapshot_id: string;
-    family_name: string;
-    family_type: ConceptFamilyType;
-    exemplar_symbol_version_id: string | null;
-    family_contract_fingerprint: string | null;
-    family_effect_fingerprint: string | null;
-    member_count: number;
-    avg_confidence: number;
-    contradiction_count: number;
-}
-
-export interface ConceptFamilyMember {
-    member_id: string;
-    family_id: string;
-    symbol_version_id: string;
-    is_exemplar: boolean;
-    is_outlier: boolean;
-    is_contradicting: boolean;
-    similarity_to_exemplar: number;
-    membership_confidence: number;
-    contradiction_flags: string[];
-    contract_deviation: string | null;
-    effect_deviation: string | null;
-}
-
-export interface FamilyBuildResult {
-    families_created: number;
-    total_members: number;
-    outliers_detected: number;
-    contradictions_detected: number;
-}
-
-// TEMPORAL INTELLIGENCE
-
-export interface TemporalRiskScore {
-    risk_id: string;
-    repo_id: string;
-    symbol_id: string;
-    snapshot_id: string;
-    change_frequency: number;
-    bug_fix_count: number;
-    regression_count: number;
-    recent_churn_30d: number;
-    distinct_authors: number;
-    composite_risk: number;
-    last_change_date: Date | null;
-}
-
-export interface CoChangePartner {
-    symbol_id: string;
-    canonical_name: string;
-    co_change_count: number;
-    jaccard_coefficient: number;
-}
-
-export interface TemporalResult {
-    commits_analyzed: number;
-    co_change_pairs: number;
-    risk_scores_computed: number;
-}
-
-export interface GitCommit {
-    sha: string;
-    author: string;
-    email: string;
-    date: Date;
-    message: string;
-    files: string[];
 }
 
 // RUNTIME EVIDENCE

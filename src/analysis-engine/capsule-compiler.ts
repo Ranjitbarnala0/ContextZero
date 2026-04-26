@@ -32,8 +32,9 @@ import { resolvePathWithinBase } from '../path-security';
 import type {
     ContextCapsule, ContextNode, CapsuleMode,
     FetchHandle, DispatchContextNode, FamilyContextNode,
-    InclusionRationale, EffectEntry,
+    InclusionRationale,
 } from '../types';
+import type { EffectEntry } from './effect-engine';
 
 const log = new Logger('capsule-compiler');
 

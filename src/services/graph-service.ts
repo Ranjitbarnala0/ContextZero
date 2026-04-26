@@ -7,7 +7,7 @@
  */
 
 import { db } from '../db-driver';
-import { firstRow, optionalStringField, numberField } from '../db-driver/result';
+import { firstRow } from '../db-driver/result';
 import { UserFacingError, classifyConfidenceBand } from '../types';
 import { Logger } from '../logger';
 
@@ -99,14 +99,14 @@ export async function getNeighbors(
         throw UserFacingError.notFound('Symbol version');
     }
 
-    const originRow = firstRow(originResult);
+    const originRow = originResult.rows[0] as Record<string, unknown>;
     nodes.push({
         symbol_version_id,
-        symbol_id: optionalStringField(originRow, 'symbol_id') ?? '',
-        canonical_name: optionalStringField(originRow, 'canonical_name') ?? '',
-        kind: optionalStringField(originRow, 'kind') ?? 'unknown',
-        file_path: optionalStringField(originRow, 'file_path') ?? '',
-        start_line: numberField(originRow, 'range_start_line') ?? 0,
+        symbol_id: (originRow.symbol_id as string) ?? '',
+        canonical_name: (originRow.canonical_name as string) ?? '',
+        kind: (originRow.kind as string) ?? 'unknown',
+        file_path: (originRow.file_path as string) ?? '',
+        start_line: typeof originRow.range_start_line === 'number' ? originRow.range_start_line : 0,
         depth: 0,
     });
 
@@ -174,17 +174,16 @@ export async function getNeighbors(
 
             const result = await db.query(sql, baseParams);
 
-            for (const raw of result.rows) {
-                const row = raw as Record<string, unknown>;
-                const neighborSvid = optionalStringField(row, 'neighbor_svid') ?? '';
+            for (const row of result.rows as Record<string, unknown>[]) {
+                const neighborSvid = (row.neighbor_svid as string) ?? '';
 
                 // Record the edge
                 edges.push({
-                    source_id: optionalStringField(row, 'src_symbol_version_id') ?? '',
-                    target_id: optionalStringField(row, 'dst_symbol_version_id') ?? '',
-                    relation_type: optionalStringField(row, 'relation_type') ?? '',
-                    confidence: numberField(row, 'confidence') ?? 1.0,
-                    strength: numberField(row, 'strength') ?? 1.0,
+                    source_id: (row.src_symbol_version_id as string) ?? '',
+                    target_id: (row.dst_symbol_version_id as string) ?? '',
+                    relation_type: (row.relation_type as string) ?? '',
+                    confidence: typeof row.confidence === 'number' ? row.confidence : 1.0,
+                    strength: typeof row.strength === 'number' ? row.strength : 1.0,
                 });
 
                 // Track new nodes
@@ -198,11 +197,11 @@ export async function getNeighbors(
 
                     nodes.push({
                         symbol_version_id: neighborSvid,
-                        symbol_id: optionalStringField(row, 'symbol_id') ?? '',
-                        canonical_name: optionalStringField(row, 'canonical_name') ?? '',
-                        kind: optionalStringField(row, 'kind') ?? 'unknown',
-                        file_path: optionalStringField(row, 'file_path') ?? '',
-                        start_line: numberField(row, 'range_start_line') ?? 0,
+                        symbol_id: (row.symbol_id as string) ?? '',
+                        canonical_name: (row.canonical_name as string) ?? '',
+                        kind: (row.kind as string) ?? 'unknown',
+                        file_path: (row.file_path as string) ?? '',
+                        start_line: typeof row.range_start_line === 'number' ? row.range_start_line : 0,
                         depth: currentDepth,
                     });
 
@@ -502,7 +501,7 @@ export async function getTests(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 4. findConcept — Concept-based discovery via keyword-decomposed trigram, family, contract & fallback search
+// 4. findConcept — Concept-based discovery via trigram + family + contract search
 // ════════════════════════════════════════════════════════════════════════════
 
 export interface FindConceptOptions {
@@ -533,41 +532,9 @@ export interface ConceptResult {
     total_found: number;
 }
 
-// ── Stop words filtered out when decomposing concept phrases into keywords ──
-const CONCEPT_STOP_WORDS = new Set([
-    'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-    'of', 'with', 'by', 'from', 'is', 'it', 'as', 'be', 'was', 'are',
-    'that', 'this', 'its', 'not', 'no', 'do', 'does', 'did', 'has', 'have',
-    'had', 'will', 'would', 'should', 'could', 'can', 'may', 'might',
-    'been', 'being', 'about', 'into', 'over', 'such', 'than', 'then',
-    'when', 'where', 'how', 'what', 'which', 'who', 'whom', 'there',
-    'here', 'all', 'each', 'every', 'both', 'any', 'some', 'so', 'if',
-    'up', 'out', 'just', 'also', 'very', 'too', 'only',
-]);
-
-/**
- * Decompose a concept phrase into meaningful keywords for search.
- * Splits on whitespace / common delimiters, filters stop words and
- * very short tokens, lowercases everything.
- */
-function extractConceptKeywords(concept: string): string[] {
-    return concept
-        .toLowerCase()
-        .split(/[\s,;:+\-/\\|]+/)
-        .map(w => w.replace(/[^a-z0-9_]/g, ''))
-        .filter(w => w.length >= 2 && !CONCEPT_STOP_WORDS.has(w));
-}
-
 /**
  * Search for symbols matching a concept string using multiple strategies:
- * per-keyword trigram name similarity, concept family matching, contract
- * text search, and keyword-based name/summary fallback.
- *
- * The concept phrase is first decomposed into individual keywords so that
- * multi-word natural-language queries like "error handling and retry logic"
- * match symbols whose names contain any of those terms (e.g. handleError,
- * retryRequest, ErrorHandler).
- *
+ * trigram name similarity, concept family matching, and contract text search.
  * Results are merged, deduplicated, and ranked by relevance.
  */
 export async function findConcept(
@@ -583,75 +550,38 @@ export async function findConcept(
     } = options;
 
     const matchMap = new Map<string, ConceptMatch>();
-    const keywords = extractConceptKeywords(concept);
 
-    // If the concept is a single short token (or reduces to nothing after
-    // stop-word removal), fall back to the raw concept string.
-    const searchTerms = keywords.length > 0 ? keywords : [concept.trim().toLowerCase()];
-
-    log.debug('Concept keywords extracted', { concept, keywords: searchTerms });
-
-    // ── Helper: append optional kind/language filters and LIMIT ──
-    function appendFilters(
-        sql: string,
-        params: unknown[],
-        startIdx: number,
-    ): { sql: string; params: unknown[] } {
-        let idx = startIdx;
-        if (kind_filter) {
-            sql += ` AND s.kind = $${idx}`;
-            params.push(kind_filter);
-            idx++;
-        }
-        if (language_filter) {
-            sql += ` AND sv.language = $${idx}`;
-            params.push(language_filter);
-            idx++;
-        }
-        return { sql, params };
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // Strategy 1: Per-keyword trigram similarity on canonical_name
-    // ────────────────────────────────────────────────────────────────
-    // For each keyword we check trigram similarity (%) OR ILIKE
-    // against canonical_name, then pick the best-matching keyword's
-    // similarity as the relevance score via GREATEST.
+    // Strategy 1: Trigram similarity on canonical_name (pg_trgm)
     {
-        // Build per-keyword OR clause and GREATEST(...) relevance
-        const params: unknown[] = [repo_id, snapshot_id];
-        let paramIdx = 3;
-
-        const orClauses: string[] = [];
-        const simExprs: string[] = [];
-        for (const kw of searchTerms) {
-            const p = `$${paramIdx}`;
-            orClauses.push(`(s.canonical_name % ${p} OR s.canonical_name ILIKE '%' || ${p} || '%')`);
-            simExprs.push(`similarity(s.canonical_name, ${p})`);
-            params.push(kw);
-            paramIdx++;
-        }
-
         let sql = `
             SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, s.kind,
                    f.path as file_path, sv.range_start_line,
-                   GREATEST(${simExprs.join(', ')}) as relevance
+                   similarity(s.canonical_name, $1) as relevance
             FROM symbols s
             JOIN symbol_versions sv ON sv.symbol_id = s.symbol_id
             JOIN files f ON f.file_id = sv.file_id
-            WHERE s.repo_id = $1
-              AND sv.snapshot_id = $2
-              AND (${orClauses.join(' OR ')})
+            WHERE s.repo_id = $2
+              AND sv.snapshot_id = $3
+              AND (s.canonical_name % $1 OR s.canonical_name ILIKE '%' || $1 || '%')
         `;
+        const params: unknown[] = [concept, repo_id, snapshot_id];
+        let paramIdx = 4;
 
-        const filtered = appendFilters(sql, params, paramIdx);
-        sql = filtered.sql;
-        paramIdx = filtered.params.length + 1;
+        if (kind_filter) {
+            sql += ` AND s.kind = $${paramIdx}`;
+            params.push(kind_filter);
+            paramIdx++;
+        }
+        if (language_filter) {
+            sql += ` AND sv.language = $${paramIdx}`;
+            params.push(language_filter);
+            paramIdx++;
+        }
 
         sql += ` ORDER BY relevance DESC LIMIT $${paramIdx}`;
-        filtered.params.push(limit);
+        params.push(limit);
 
-        const nameResult = await db.query(sql, filtered.params);
+        const nameResult = await db.query(sql, params);
 
         for (const row of nameResult.rows as Record<string, unknown>[]) {
             const svid = (row.symbol_version_id as string) ?? '';
@@ -672,46 +602,40 @@ export async function findConcept(
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Strategy 2: Per-keyword concept family name similarity
-    // ────────────────────────────────────────────────────────────────
+    // Strategy 2: Concept family name similarity
     {
-        const params: unknown[] = [repo_id, snapshot_id];
-        let paramIdx = 3;
-
-        const orClauses: string[] = [];
-        const simExprs: string[] = [];
-        for (const kw of searchTerms) {
-            const p = `$${paramIdx}`;
-            orClauses.push(`(cf.family_name % ${p} OR cf.family_name ILIKE '%' || ${p} || '%')`);
-            simExprs.push(`similarity(cf.family_name, ${p})`);
-            params.push(kw);
-            paramIdx++;
-        }
-
         let sql = `
             SELECT cfm.symbol_version_id, sv.symbol_id, s.canonical_name, s.kind,
                    f.path as file_path, sv.range_start_line,
-                   GREATEST(${simExprs.join(', ')}) as relevance,
+                   similarity(cf.family_name, $1) as relevance,
                    cf.family_name, cf.family_type
             FROM concept_families cf
             JOIN concept_family_members cfm ON cfm.family_id = cf.family_id
             JOIN symbol_versions sv ON sv.symbol_version_id = cfm.symbol_version_id
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
-            WHERE cf.repo_id = $1
-              AND cf.snapshot_id = $2
-              AND (${orClauses.join(' OR ')})
+            WHERE cf.repo_id = $2
+              AND cf.snapshot_id = $3
+              AND (cf.family_name % $1 OR cf.family_name ILIKE '%' || $1 || '%')
         `;
+        const params: unknown[] = [concept, repo_id, snapshot_id];
+        let paramIdx = 4;
 
-        const filtered = appendFilters(sql, params, paramIdx);
-        sql = filtered.sql;
-        paramIdx = filtered.params.length + 1;
+        if (kind_filter) {
+            sql += ` AND s.kind = $${paramIdx}`;
+            params.push(kind_filter);
+            paramIdx++;
+        }
+        if (language_filter) {
+            sql += ` AND sv.language = $${paramIdx}`;
+            params.push(language_filter);
+            paramIdx++;
+        }
 
         sql += ` ORDER BY relevance DESC LIMIT $${paramIdx}`;
-        filtered.params.push(limit);
+        params.push(limit);
 
-        const familyResult = await db.query(sql, filtered.params);
+        const familyResult = await db.query(sql, params);
 
         for (const row of familyResult.rows as Record<string, unknown>[]) {
             const svid = (row.symbol_version_id as string) ?? '';
@@ -732,26 +656,8 @@ export async function findConcept(
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Strategy 3: Per-keyword contract text search
-    // ────────────────────────────────────────────────────────────────
-    // Any keyword matching in any contract field counts as a hit.
+    // Strategy 3: Contract text search (input/output/error contracts)
     {
-        const params: unknown[] = [snapshot_id, repo_id];
-        let paramIdx = 3;
-
-        const orClauses: string[] = [];
-        for (const kw of searchTerms) {
-            const p = `$${paramIdx}`;
-            orClauses.push(
-                `(cp.input_contract ILIKE '%' || ${p} || '%'` +
-                ` OR cp.output_contract ILIKE '%' || ${p} || '%'` +
-                ` OR cp.error_contract ILIKE '%' || ${p} || '%')`,
-            );
-            params.push(kw);
-            paramIdx++;
-        }
-
         let sql = `
             SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, s.kind,
                    f.path as file_path, sv.range_start_line,
@@ -760,19 +666,30 @@ export async function findConcept(
             JOIN symbol_versions sv ON sv.symbol_version_id = cp.symbol_version_id
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
-            WHERE sv.snapshot_id = $1
-              AND s.repo_id = $2
-              AND (${orClauses.join(' OR ')})
+            WHERE sv.snapshot_id = $2
+              AND s.repo_id = $3
+              AND (cp.input_contract ILIKE '%' || $1 || '%'
+                   OR cp.output_contract ILIKE '%' || $1 || '%'
+                   OR cp.error_contract ILIKE '%' || $1 || '%')
         `;
+        const params: unknown[] = [concept, snapshot_id, repo_id];
+        let paramIdx = 4;
 
-        const filtered = appendFilters(sql, params, paramIdx);
-        sql = filtered.sql;
-        paramIdx = filtered.params.length + 1;
+        if (kind_filter) {
+            sql += ` AND s.kind = $${paramIdx}`;
+            params.push(kind_filter);
+            paramIdx++;
+        }
+        if (language_filter) {
+            sql += ` AND sv.language = $${paramIdx}`;
+            params.push(language_filter);
+            paramIdx++;
+        }
 
         sql += ` LIMIT $${paramIdx}`;
-        filtered.params.push(limit);
+        params.push(limit);
 
-        const contractResult = await db.query(sql, filtered.params);
+        const contractResult = await db.query(sql, params);
 
         for (const row of contractResult.rows as Record<string, unknown>[]) {
             const svid = (row.symbol_version_id as string) ?? '';
@@ -793,80 +710,6 @@ export async function findConcept(
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Strategy 4: Keyword ILIKE fallback on name + summary
-    // ────────────────────────────────────────────────────────────────
-    // If earlier strategies returned fewer results than the limit,
-    // broaden the search to match keywords against the symbol summary
-    // and canonical_name via ILIKE (no trigram threshold required).
-    if (matchMap.size < limit) {
-        const remaining = limit - matchMap.size;
-
-        const params: unknown[] = [repo_id, snapshot_id];
-        let paramIdx = 3;
-
-        const orClauses: string[] = [];
-        for (const kw of searchTerms) {
-            const p = `$${paramIdx}`;
-            orClauses.push(
-                `(s.canonical_name ILIKE '%' || ${p} || '%'` +
-                ` OR sv.summary ILIKE '%' || ${p} || '%')`,
-            );
-            params.push(kw);
-            paramIdx++;
-        }
-
-        // Exclude already-found symbol_version_ids
-        let excludeClause = '';
-        const existingIds = Array.from(matchMap.keys());
-        if (existingIds.length > 0) {
-            const exPlaceholders = existingIds.map((_, i) => `$${paramIdx + i}`).join(',');
-            excludeClause = ` AND sv.symbol_version_id NOT IN (${exPlaceholders})`;
-            params.push(...existingIds);
-            paramIdx += existingIds.length;
-        }
-
-        let sql = `
-            SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, s.kind,
-                   f.path as file_path, sv.range_start_line,
-                   0.5 as relevance
-            FROM symbols s
-            JOIN symbol_versions sv ON sv.symbol_id = s.symbol_id
-            JOIN files f ON f.file_id = sv.file_id
-            WHERE s.repo_id = $1
-              AND sv.snapshot_id = $2
-              AND (${orClauses.join(' OR ')})
-              ${excludeClause}
-        `;
-
-        const filtered = appendFilters(sql, params, paramIdx);
-        sql = filtered.sql;
-        paramIdx = filtered.params.length + 1;
-
-        sql += ` LIMIT $${paramIdx}`;
-        filtered.params.push(remaining);
-
-        const fallbackResult = await db.query(sql, filtered.params);
-
-        for (const row of fallbackResult.rows as Record<string, unknown>[]) {
-            const svid = (row.symbol_version_id as string) ?? '';
-            if (svid && !matchMap.has(svid)) {
-                matchMap.set(svid, {
-                    symbol_version_id: svid,
-                    symbol_id: (row.symbol_id as string) ?? '',
-                    canonical_name: (row.canonical_name as string) ?? '',
-                    kind: (row.kind as string) ?? 'unknown',
-                    file_path: (row.file_path as string) ?? '',
-                    start_line: typeof row.range_start_line === 'number' ? row.range_start_line : 0,
-                    relevance: 0.5,
-                    match_source: 'name',
-                    family_name: null,
-                    family_type: null,
-                });
-            }
-        }
-    }
-
     // Merge, sort by relevance descending, and apply final limit
     const matches = Array.from(matchMap.values())
         .sort((a, b) => b.relevance - a.relevance)
@@ -874,7 +717,6 @@ export async function findConcept(
 
     log.info('Concept search complete', {
         concept,
-        keywords: searchTerms,
         total_found: matchMap.size,
         returned: matches.length,
     });

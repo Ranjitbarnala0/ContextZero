@@ -168,7 +168,6 @@ class DatabaseDriver {
     private readonly slowQueryMs: number;
     private readonly circuit: CircuitBreaker;
     private readonly maxWaitingQueries: number;
-    private lastPoolPressureWarn = 0;
     private closed = false;
 
     private constructor() {
@@ -179,6 +178,8 @@ class DatabaseDriver {
         };
         const maxConnections = safeInt(process.env['DB_MAX_CONNECTIONS'], 20);
         const statementTimeoutMs = safeInt(process.env['DB_STATEMENT_TIMEOUT_MS'], 30_000);
+        const lockTimeoutMs = safeInt(process.env['DB_LOCK_TIMEOUT_MS'], 5_000);
+        const idleInTxnTimeoutMs = safeInt(process.env['DB_IDLE_IN_TXN_TIMEOUT_MS'], 60_000);
         this.slowQueryMs = safeInt(process.env['DB_SLOW_QUERY_MS'], 500);
         this.maxWaitingQueries = maxConnections * 2; // Reject when queue exceeds 2x pool size
         this.pool = new Pool({
@@ -200,7 +201,17 @@ class DatabaseDriver {
             this.circuit.recordFailure();
         });
 
-        this.pool.on('connect', () => {
+        this.pool.on('connect', (client) => {
+            // Apply per-session safety timeouts that the pg pool config does not expose directly.
+            // statement_timeout already comes from the Pool config above.
+            // lock_timeout: prevent a hung advisory/row lock from blocking ingest indefinitely.
+            // idle_in_transaction_session_timeout: kill connections holding open transactions.
+            client.query(
+                `SET lock_timeout = '${lockTimeoutMs}ms'; ` +
+                `SET idle_in_transaction_session_timeout = '${idleInTxnTimeoutMs}ms';`,
+            ).catch((err: Error) => {
+                log.warn('Failed to apply session timeouts on new client', { error: err.message });
+            });
             log.debug('New database client connected');
         });
 
@@ -244,15 +255,11 @@ class DatabaseDriver {
         }
 
         if (this.pool.waitingCount > 0) {
-            const now = Date.now();
-            if (now - this.lastPoolPressureWarn >= 5_000) {
-                this.lastPoolPressureWarn = now;
-                log.warn('Pool pressure: queries waiting for connections', {
-                    waitingCount: this.pool.waitingCount,
-                    totalCount: this.pool.totalCount,
-                    idleCount: this.pool.idleCount,
-                });
-            }
+            log.warn('Pool pressure: queries waiting for connections', {
+                waitingCount: this.pool.waitingCount,
+                totalCount: this.pool.totalCount,
+                idleCount: this.pool.idleCount,
+            });
         }
 
         return withRetry(
@@ -349,6 +356,107 @@ class DatabaseDriver {
                 await client.query(stmt.text, stmt.params);
             }
         });
+    }
+
+    /**
+     * Bulk-insert many rows in a single round-trip per chunk via multi-row VALUES.
+     *
+     * Compared to `batchInsert` (which serialises N statements in one transaction
+     * — N round-trips), this collapses each chunk into ONE round-trip. For 5k rows
+     * with a localhost DB that's ~5k × ~3ms = 15s vs ~3 round-trips total.
+     *
+     * Identifier safety: `table` and every entry in `columns` must match
+     * `[A-Za-z_][A-Za-z0-9_]*`. Anything else is rejected so user-controlled
+     * data cannot land in the SQL string.
+     *
+     * @param table             Target table name (validated identifier).
+     * @param columns           Column names in row-order (validated identifiers).
+     * @param rows              Each inner array MUST have `columns.length` items.
+     * @param options.conflict  Optional ON CONFLICT clause appended verbatim,
+     *                          e.g. `"ON CONFLICT (id) DO NOTHING"`. Caller is
+     *                          responsible for the validity of this clause.
+     * @param options.client    Optional pg PoolClient to run inside an existing
+     *                          transaction. If omitted, opens a single statement.
+     * @returns                 Total number of rows inserted (per pg's rowCount).
+     */
+    public async bulkInsert(
+        table: string,
+        columns: string[],
+        rows: unknown[][],
+        options: { conflict?: string; client?: PoolClient } = {},
+    ): Promise<{ rowsInserted: number }> {
+        if (rows.length === 0) return { rowsInserted: 0 };
+        if (columns.length === 0) {
+            throw new Error('bulkInsert: columns must not be empty');
+        }
+
+        const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+        if (!IDENT_RE.test(table)) {
+            throw new Error(`bulkInsert: invalid table identifier ${JSON.stringify(table)}`);
+        }
+        for (const c of columns) {
+            if (!IDENT_RE.test(c)) {
+                throw new Error(`bulkInsert: invalid column identifier ${JSON.stringify(c)}`);
+            }
+        }
+
+        const colCount = columns.length;
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i]!.length !== colCount) {
+                throw new Error(
+                    `bulkInsert: row ${i} has ${rows[i]!.length} values, expected ${colCount}`,
+                );
+            }
+        }
+
+        // PostgreSQL's hard cap is 65535 placeholders per statement. We keep a
+        // safety margin at 30k so we don't bump up against driver-side parsing
+        // limits or memory pressure on very wide tables.
+        const MAX_PARAMS = 30_000;
+        const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / colCount));
+
+        const colList = columns.join(', ');
+        const conflictSql = options.conflict ? ` ${options.conflict}` : '';
+        let totalInserted = 0;
+
+        const runStatement = async (
+            chunk: unknown[][],
+            client: PoolClient | DatabaseDriver,
+        ): Promise<number> => {
+            const valuesClauses: string[] = [];
+            const params: unknown[] = [];
+            let idx = 1;
+            for (const row of chunk) {
+                const placeholders: string[] = [];
+                for (let c = 0; c < colCount; c++) {
+                    placeholders.push(`$${idx++}`);
+                    params.push(row[c]);
+                }
+                valuesClauses.push(`(${placeholders.join(', ')})`);
+            }
+            const sql = `INSERT INTO ${table} (${colList}) VALUES ${valuesClauses.join(', ')}${conflictSql}`;
+            const result = client instanceof DatabaseDriver
+                ? await client.query(sql, params)
+                : await client.query(sql, params);
+            return result.rowCount ?? 0;
+        };
+
+        if (options.client) {
+            for (let offset = 0; offset < rows.length; offset += maxRowsPerChunk) {
+                const chunk = rows.slice(offset, offset + maxRowsPerChunk);
+                totalInserted += await runStatement(chunk, options.client);
+            }
+        } else {
+            // No external client — wrap in our own transaction so multi-chunk
+            // inserts are still atomic.
+            await this.transaction(async (client) => {
+                for (let offset = 0; offset < rows.length; offset += maxRowsPerChunk) {
+                    const chunk = rows.slice(offset, offset + maxRowsPerChunk);
+                    totalInserted += await runStatement(chunk, client);
+                }
+            });
+        }
+        return { rowsInserted: totalInserted };
     }
 
     public async healthCheck(): Promise<{

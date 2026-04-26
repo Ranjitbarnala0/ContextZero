@@ -1546,7 +1546,6 @@ export class DispatchResolver {
 
         // Fallback: compute from structural_relations on the fly
         const svRows = await coreDataService.getSymbolVersionsForSnapshot(snapshotId);
-        const svByCanonical = DispatchResolver.buildCanonicalMap(svRows);
 
         // Load inheritance relations
         const relResult = await db.query(`

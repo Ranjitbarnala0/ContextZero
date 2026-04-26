@@ -119,6 +119,7 @@ export const logging = Object.freeze({
 export const features = Object.freeze({
     enableMcpAuth: envBool('SCG_MCP_AUTH_ENABLED', false),
     mcpSecret: envString('SCG_MCP_SECRET'),
+    mcpAdminSecret: envString('SCG_MCP_ADMIN_SECRET'),
     enableMetrics: envBool('SCG_METRICS_ENABLED', true),
 });
 

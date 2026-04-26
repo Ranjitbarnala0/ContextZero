@@ -105,34 +105,35 @@ export class HomologInferenceEngine {
             profileCache.set(`cp:${svId}`, cp);
         }
 
-        // Score each candidate across 7 dimensions
-        const scored: HomologCandidate[] = [];
+        // Score each candidate across 7 dimensions.
+        // Profile cache is pre-warmed above (L97-106), so most per-candidate work
+        // is CPU-bound or cache-bound. Run candidates in parallel for ~10-50x latency win.
+        const scoringResults = await Promise.all(
+            candidates
+                .filter(c => c.symbol_version_id !== targetSymbolVersionId)
+                .map(async (candidate): Promise<HomologCandidate | null> => {
+                    const evidence = await this.scoreCandidate(target, candidate, snapshotId);
 
-        for (const candidate of candidates) {
-            if (candidate.symbol_version_id === targetSymbolVersionId) continue;
+                    if (evidence.evidence_family_count < MIN_EVIDENCE_FAMILIES) return null;
+                    if (evidence.weighted_total < confidenceThreshold) return null;
 
-            const evidence = await this.scoreCandidate(target, candidate, snapshotId);
+                    const [contradictions, relationType] = await Promise.all([
+                        this.detectContradictions(target, candidate),
+                        this.classifyRelationType(target, candidate, evidence),
+                    ]);
 
-            // Check minimum evidence families
-            if (evidence.evidence_family_count < MIN_EVIDENCE_FAMILIES) continue;
-            if (evidence.weighted_total < confidenceThreshold) continue;
-
-            // Detect contradictions
-            const contradictions = await this.detectContradictions(target, candidate);
-
-            // Classify relation type
-            const relationType = await this.classifyRelationType(target, candidate, evidence);
-
-            scored.push({
-                symbol_id: candidate.symbol_id,
-                symbol_version_id: candidate.symbol_version_id,
-                symbol_name: candidate.canonical_name,
-                relation_type: relationType,
-                confidence: evidence.weighted_total,
-                evidence,
-                contradiction_flags: contradictions,
-            });
-        }
+                    return {
+                        symbol_id: candidate.symbol_id,
+                        symbol_version_id: candidate.symbol_version_id,
+                        symbol_name: candidate.canonical_name,
+                        relation_type: relationType,
+                        confidence: evidence.weighted_total,
+                        evidence,
+                        contradiction_flags: contradictions,
+                    };
+                }),
+        );
+        const scored: HomologCandidate[] = scoringResults.filter((s): s is HomologCandidate => s !== null);
 
         // Sort by confidence descending
         scored.sort((a, b) => b.confidence - a.confidence);
@@ -154,17 +155,9 @@ export class HomologInferenceEngine {
         // Single transaction for all homologs — atomic batch persistence
         await db.transaction(async (client: PoolClient) => {
             for (const hom of homologs) {
-                const bundleId = uuidv4();
-
-                // Create evidence bundle
-                await db.queryWithClient(client, `
-                    INSERT INTO evidence_bundles (
-                        evidence_bundle_id, semantic_score, structural_score,
-                        behavioral_score, contract_score, test_score, history_score,
-                        contradiction_flags, feature_payload
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                `, [
-                    bundleId,
+                const newBundleId = uuidv4();
+                const scoreParams = [
+                    newBundleId,
                     hom.evidence.semantic_intent_similarity,
                     hom.evidence.normalized_logic_similarity,
                     hom.evidence.behavioral_overlap,
@@ -173,7 +166,38 @@ export class HomologInferenceEngine {
                     hom.evidence.history_co_change,
                     hom.contradiction_flags,
                     JSON.stringify(hom.evidence),
-                ]);
+                ];
+
+                // Create evidence bundle. Migration 013 added uq_evidence_bundle_scores
+                // (UNIQUE over the 6 score columns) so two homologs with identical
+                // scores would otherwise abort the whole transaction.
+                const bundleInsert = await db.queryWithClient(client, `
+                    INSERT INTO evidence_bundles (
+                        evidence_bundle_id, semantic_score, structural_score,
+                        behavioral_score, contract_score, test_score, history_score,
+                        contradiction_flags, feature_payload
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT ON CONSTRAINT uq_evidence_bundle_scores DO NOTHING
+                    RETURNING evidence_bundle_id
+                `, scoreParams);
+
+                let bundleId: string;
+                if (bundleInsert.rows.length > 0) {
+                    bundleId = (bundleInsert.rows[0] as { evidence_bundle_id: string }).evidence_bundle_id;
+                } else {
+                    // Conflict — score tuple already represented by an existing bundle.
+                    const existing = await db.queryWithClient(client, `
+                        SELECT evidence_bundle_id FROM evidence_bundles
+                        WHERE semantic_score = $1 AND structural_score = $2
+                        AND behavioral_score = $3 AND contract_score = $4
+                        AND test_score = $5 AND history_score = $6
+                        LIMIT 1
+                    `, scoreParams.slice(1, 7));
+                    if (existing.rows.length === 0) {
+                        throw new Error('evidence_bundles ON CONFLICT returned no rows but lookup failed');
+                    }
+                    bundleId = (existing.rows[0] as { evidence_bundle_id: string }).evidence_bundle_id;
+                }
 
                 // Create inferred relation
                 const relationId = uuidv4();

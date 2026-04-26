@@ -5,23 +5,21 @@
 -- 3. Add index on snapshots(repo_id, created_at) for efficient age-based queries
 -- 4. Add index on change_transactions(state, updated_at) for stale cleanup
 
--- ─── Snapshot created_at (dependency for retention indexes) ──────────────────
--- The original schema (001) tracked only indexed_at, but retention and temporal
--- queries need a stable creation timestamp. Add it up front — idempotent for
--- installs that already ran migration 017.
--- NOTE: backfill to indexed_at happens here (in migration 017 as well, idempotent).
+-- ─── Snapshot Lifecycle Columns ──────────────────────────────────────────────
+-- `created_at` is required by the `idx_snapshots_repo_created` index below
+-- and by 015's `idx_snapshots_repo_status_created`. Originally added in a
+-- later migration (017), but the indexes in 014/015 reference it — so we add
+-- it here (idempotent) to make a fresh-DB bootstrap succeed in correct order.
+-- Migration 017's `ADD COLUMN IF NOT EXISTS` becomes a no-op when 014 has
+-- already added the column.
+--
+-- `retained_until`: NULL means "retain indefinitely" (default). When a
+-- retention policy runs, it stamps retained_until with the computed expiry
+-- timestamp. Snapshots past their retained_until are eligible for cleanup
+-- on the next cycle.
 
 ALTER TABLE snapshots
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
-UPDATE snapshots
-SET created_at = indexed_at
-WHERE created_at > indexed_at;
-
--- ─── Snapshot Retention Column ────────────────────────────────────────────────
--- NULL means "retain indefinitely" (default). When a retention policy runs,
--- it stamps retained_until with the computed expiry timestamp. Snapshots
--- past their retained_until are eligible for cleanup on the next cycle.
 
 ALTER TABLE snapshots
     ADD COLUMN IF NOT EXISTS retained_until TIMESTAMPTZ DEFAULT NULL;

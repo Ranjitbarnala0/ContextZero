@@ -547,18 +547,21 @@ function extractRelationsFromBody(
                 targetName = child.expression.name.getText(sourceFile);
             }
 
-            // Emit only the full call chain. The bare method name (e.g. `find`,
-            // `update`, `destroy`) was previously also emitted as a fallback,
-            // but because canonical names are not unique it resolved to an
-            // arbitrary symbol and corrupted transitive behavioral propagation.
-            // Dispatch resolution uses the full chain plus points-to facts
-            // (see dispatch-resolver.ts) to resolve calls precisely.
+            // Emit full chain relation (primary — enables dispatch resolution)
             if (fullChain) {
                 relations.push({
                     source_key: sourceKey,
                     target_name: fullChain,
                     relation_type: 'calls',
                 });
+                // Also emit bare method name (enables matching without type inference)
+                if (targetName && targetName !== fullChain) {
+                    relations.push({
+                        source_key: sourceKey,
+                        target_name: targetName,
+                        relation_type: 'calls',
+                    });
+                }
             } else if (targetName) {
                 relations.push({
                     source_key: sourceKey,
