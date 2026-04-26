@@ -35,6 +35,20 @@ function loadApiKeys(): Buffer[] {
 }
 
 /**
+ * Load ADMIN API keys (separate allowlist for admin tools).
+ * If SCG_ADMIN_API_KEYS is unset, admin endpoints fall back to SCG_API_KEYS
+ * (backward compatible) but log a warning at startup.
+ */
+function loadAdminApiKeys(): Buffer[] {
+    const raw = process.env['SCG_ADMIN_API_KEYS'] || '';
+    if (!raw.trim()) return [];
+    return raw.split(',')
+        .map(k => k.trim())
+        .filter(k => k.length > 0)
+        .map(k => Buffer.from(k, 'utf-8'));
+}
+
+/**
  * Validate loaded API keys meet minimum length for production use.
  * Logs CRITICAL warnings for each weak key so operators can remediate.
  */
@@ -70,6 +84,16 @@ validateApiKeyEntropy(apiKeys);
 
 if (apiKeys.length === 0) {
     log.warn('No API keys configured (SCG_API_KEYS). All requests will be rejected.');
+}
+
+let adminApiKeys = loadAdminApiKeys();
+validateApiKeyEntropy(adminApiKeys);
+
+if (adminApiKeys.length === 0) {
+    log.warn(
+        'No SCG_ADMIN_API_KEYS configured — admin endpoints will accept any valid SCG_API_KEYS holder. ' +
+        'For role separation, set SCG_ADMIN_API_KEYS to a distinct allowlist.',
+    );
 }
 
 // ────────── Per-IP Brute-Force Rate Limiting ──────────
@@ -135,6 +159,12 @@ function hotReloadApiKeys(): void {
     validateApiKeyEntropy(newKeys);
     apiKeys = newKeys;
     log.info('SIGHUP: API keys reloaded', { count: newKeys.length });
+
+    // Admin keys are optional — empty is a valid configuration (fall-through to apiKeys).
+    const newAdminKeys = loadAdminApiKeys();
+    validateApiKeyEntropy(newAdminKeys);
+    adminApiKeys = newAdminKeys;
+    log.info('SIGHUP: admin API keys reloaded', { count: newAdminKeys.length });
 }
 
 export function currentLockoutMsForIp(ip: string): number {
@@ -305,6 +335,45 @@ function isPresentedKeyValid(presented: string): boolean {
     if (apiKeys.length === 0) return false;
     const presentedBuf = Buffer.from(presented, 'utf-8');
     return apiKeys.some(key => safeCompare(presentedBuf, key));
+}
+
+/**
+ * Check whether the presented key is authorised for ADMIN endpoints.
+ * - If SCG_ADMIN_API_KEYS is configured: presented key must be in the admin allowlist.
+ * - If SCG_ADMIN_API_KEYS is empty: fall back to the regular SCG_API_KEYS allowlist
+ *   (backward compatible — operators that haven't enabled admin separation keep working).
+ */
+export function isPresentedKeyAdmin(presented: string): boolean {
+    const presentedBuf = Buffer.from(presented, 'utf-8');
+    if (adminApiKeys.length > 0) {
+        return adminApiKeys.some(key => safeCompare(presentedBuf, key));
+    }
+    return apiKeys.some(key => safeCompare(presentedBuf, key));
+}
+
+/**
+ * Admin authentication middleware.
+ * Composes with `authMiddleware`: returns next() only if the presented key is
+ * also in the admin allowlist (or, when no admin keys configured, in the
+ * regular allowlist for backward compatibility).
+ *
+ * Apply BEFORE the route body of any /scg_admin_* endpoint.
+ */
+export function requireAdminKey(req: Request, res: Response, next: NextFunction): void {
+    const presented = extractKey(req);
+    if (!presented || !isPresentedKeyAdmin(presented)) {
+        log.warn('Admin endpoint rejected: caller is not an admin', {
+            path: req.path,
+            ip: getClientIp(req),
+            admin_keys_configured: adminApiKeys.length > 0,
+        });
+        markAuthFailure(res);
+        res.status(403).json(withCorrelationId(req, {
+            error: 'Admin endpoint requires an admin-grade API key.',
+        }));
+        return;
+    }
+    next();
 }
 
 function withCorrelationId(

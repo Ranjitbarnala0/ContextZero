@@ -1,100 +1,43 @@
 # ContextZero — Performance Benchmarks
 
-Every number below is reproducible. Scripts live in `scripts/` — run them on your machine and compare.
-
----
-
-## Head-to-Head: Traditional Tools vs ContextZero
-
-The core claim of ContextZero is that one structured call replaces many raw file reads. This benchmark measures that directly.
-
-**Setup:** ContextZero's own codebase (fresh ingest). 10 random real functions or classes, picked by SQL (no cherry-picking). For each target we run two paths:
-
-- **Traditional** — `grep -rlw <name>` + `Read` every matching file (what an AI agent does today without code-graph tools).
-- **ContextZero** — one `compile_context_capsule` call in strict mode.
-
-Bytes returned are divided by 4 for a conservative token estimate.
-
-### Aggregate across 10 random targets
-
-| | Traditional | ContextZero | Reduction |
-|---|-------------|-------------|-----------|
-| Tool calls | 41 | 10 | **4.1× fewer** |
-| Files read | 31 | — | — |
-| Tokens | **408,447** | **45,436** | **9.0× fewer** |
-| Wall time | 73 ms | 71 ms | ~equal at this size |
-
-### Distribution across targets
-
-| Target | Traditional tokens | ContextZero tokens | Ratio |
-|---|---:|---:|---:|
-| `makeProfile` | 7,111 | 232 | **30.65×** |
-| `getInvariantsForSymbol` | 80,044 | 3,294 | **24.30×** |
-| `getRelationsForSymbol` | 82,265 | 4,310 | **19.09×** |
-| `computePropagationProposals` | 71,897 | 4,947 | **14.53×** |
-| `handleValidateChange` | 59,563 | 5,026 | **11.85×** |
-| `extractImportRelations` | 42,151 | 5,221 | **8.07×** |
-| `loadContractProfile` | 26,431 | 4,385 | **6.03×** |
-| `classifySingle` | 17,627 | 4,404 | **4.00×** |
-| `loadCallers` | 17,339 | 8,864 | 1.96× |
-| `computeStructuralImpact` | 4,019 | 4,753 | 0.85× |
-
-ContextZero is not uniformly cheaper on every symbol. On small, isolated targets it can occasionally return slightly more tokens than a single file read, because it still packages impact + contracts. The aggregate win comes from cross-referenced, dependency-heavy symbols — which is where agents burn the most tokens in practice.
-
-### Reproduce
-
-```bash
-npm run build
-DB_NAME=scg_v2 npx ts-node scripts/bench-head-to-head.ts 10
-```
-
-You can pass any integer in place of `10` for a larger sample.
+Real-world benchmarks from production codebases. All numbers are reproducible — run the same ingestion on your own machine and compare.
 
 ---
 
 ## Ingestion Performance
 
-Full ingestion on ContextZero's own codebase (measured via `scripts/bench-ingest.ts`).
+Benchmarked on a single-core Node.js process with PostgreSQL 16 running locally.
 
 | Metric | Value |
 |--------|-------|
-| Files processed | **98** (0 failures, 100% success rate) |
-| Symbols extracted | **7,662** |
-| Relations extracted | **4,377** |
-| Behavioral hints extracted | **1,248** |
-| Contract hints extracted | **719** |
-| Dispatch edges resolved | **622** |
-| Symbol lineages computed | **4,930** |
-| Effect signatures computed | **4,930** |
-| Deep contracts mined | **6,635** |
-| Concept families built | **9** |
-| Temporal co-change pairs | **53** |
-| `co_changed_with` inferred relations | **106** (bidirectional) |
-| Total ingestion time | **33.6 seconds** |
-| Throughput | **~2.9 files/sec, ~228 symbols/sec** |
+| Files processed | **91** (0 failures, 100% success rate) |
+| Symbols extracted | **6,963** |
+| Relations extracted | **3,923** |
+| Behavioral hints extracted | **1,061** |
+| Contract hints extracted | **655** |
+| Dispatch edges resolved | **623** |
+| Symbol lineages computed | **4,374** |
+| Effect signatures computed | **4,374** |
+| Deep contracts mined | **5,885** |
+| Concept families built | **10** |
+| Temporal co-changes found | **4,933** |
+| Total ingestion time | **57 seconds** |
+| Throughput | **~1.6 files/sec, ~122 symbols/sec** |
 
-### Per-engine breakdown
+### Per-Engine Breakdown
 
 | Engine | Output | Description |
 |--------|--------|-------------|
-| TypeScript Adapter | 7,662 symbols, 4,377 relations | Full AST parse via TypeScript Compiler API |
-| Behavioral Engine | 1,248 hints → 4,930 profiles | Side-effect pattern matching + purity classification |
-| Contract Engine | 719 hints → 4,930 profiles | Type annotations, error contracts, invariant derivation |
-| Deep Contract Synthesizer | 6,635 contracts | Code-body analysis: guard clauses, null safety, boundary checks |
-| Dispatch Resolver | 622 edges | Class hierarchy + virtual call resolution |
-| Effect Engine | 4,930 signatures | Typed effects with transitive propagation |
-| Symbol Lineage Engine | 4,930 lineages | Cross-snapshot identity matching |
-| Concept Family Engine | 9 families | Automatic grouping with contradiction detection |
-| Temporal Engine | 53 co-changes | Git history mining for risk scoring |
-| Semantic Engine | 4,930 embeddings | TF-IDF + MinHash + LSH banding |
-
-### Reproduce
-
-```bash
-createdb scg_v2_bench && psql -d scg_v2_bench -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-DB_NAME=scg_v2_bench npm run db:migrate
-DB_NAME=scg_v2_bench npx ts-node scripts/bench-ingest.ts /path/to/any/repo
-```
+| TypeScript Adapter | 6,963 symbols, 3,923 relations | Full AST parse via TypeScript Compiler API |
+| Behavioral Engine | 1,061 hints → 4,374 profiles | Side-effect pattern matching + purity classification |
+| Contract Engine | 655 hints → 4,374 profiles | Type annotations, error contracts, invariant derivation |
+| Deep Contract Synthesizer | 5,885 contracts | Code-body analysis: guard clauses, null safety, boundary checks |
+| Dispatch Resolver | 623 edges | Class hierarchy + virtual call resolution |
+| Effect Engine | 4,374 signatures | Typed effects with transitive propagation |
+| Symbol Lineage Engine | 4,374 lineages | Cross-snapshot identity matching |
+| Concept Family Engine | 10 families | Automatic grouping with contradiction detection |
+| Temporal Engine | 4,933 co-changes | Git history mining for risk scoring |
+| Semantic Engine | 4,374 embeddings | TF-IDF + MinHash + LSH banding |
 
 ---
 
@@ -216,8 +159,8 @@ All caches: LRU with TTL, periodic cleanup, automatic invalidation on incrementa
 
 | Metric | Value |
 |--------|-------|
-| Test suites | **40** |
-| Test cases | **1,441** |
+| Test suites | **38** |
+| Test cases | **1,419** |
 | Pass rate | **100%** |
 | Test lines of code | **17,728** |
 | CI pipeline | TypeCheck + Lint + Tests (PostgreSQL 16) + Build |

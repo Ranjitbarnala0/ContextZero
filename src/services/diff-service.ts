@@ -18,7 +18,6 @@ import {
 } from '../db-driver/result';
 import { behavioralEngine } from '../analysis-engine/behavioral';
 import { contractEngine } from '../analysis-engine/contracts';
-import { effectEngine } from '../analysis-engine/effect-engine';
 import { Logger } from '../logger';
 import { UserFacingError } from '../types';
 import type { PurityClass } from '../types';
@@ -174,9 +173,9 @@ function maxSeverity(
 
 /**
  * Compare before/after symbol versions across all behavioral and semantic
- * dimensions.  Loads behavioral profiles, contract profiles, and effect
- * signatures (V2), then compares dimension-by-dimension to produce a
- * structured diff with per-dimension severity.
+ * dimensions.  Loads behavioral profiles and contract profiles, then compares
+ * dimension-by-dimension to produce a structured diff with per-dimension
+ * severity.
  */
 export async function computeSemanticDiff(
     options: SemanticDiffOptions,
@@ -204,13 +203,7 @@ export async function computeSemanticDiff(
         contractEngine.getProfile(options.after_symbol_version_id),
     ]);
 
-    // 4. Load effect signatures for both (V2 data, may not exist)
-    const [beforeEs, afterEs] = await Promise.all([
-        effectEngine.getEffectSignature(options.before_symbol_version_id),
-        effectEngine.getEffectSignature(options.after_symbol_version_id),
-    ]);
-
-    // 5. Compare dimension by dimension
+    // 4. Compare dimension by dimension
     const changes: SemanticChange[] = [];
 
     // -- Purity --

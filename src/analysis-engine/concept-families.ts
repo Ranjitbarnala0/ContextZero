@@ -449,14 +449,6 @@ export class ConceptFamilyEngine {
      * Groups classes/functions sharing suffixes like *Engine, *Service, *Handler,
      * *Controller, *Repository, *Factory, *Middleware, *Validator, *Resolver.
      * Used when homolog edges are sparse (small repos).
-     *
-     * Gating: a naming-suffix bucket must also share a behavioral signal
-     * (matching purity_class or overlapping effect categories) before it
-     * becomes a cluster. This prevents grouping by coincidental name overlap —
-     * e.g. `queryWithClient` (runs DB queries) and `lockClient` (acquires a
-     * Postgres advisory lock) both end in `Client` but have nothing else in
-     * common. Bucket members are split into behaviorally-compatible sub-groups
-     * and each sub-group becomes its own cluster.
      */
     private async clusterByNamingPatterns(snapshotId: string): Promise<RawCluster[]> {
         const result = await db.query(`
@@ -487,74 +479,27 @@ export class ConceptFamilyEngine {
             }
         }
 
-        // Collect all candidate svIds so we can batch-load behavioral profiles.
-        const allCandidates: string[] = [];
-        for (const members of buckets.values()) {
-            for (const id of members) allCandidates.push(id);
-        }
-        if (allCandidates.length === 0) return [];
-
-        const loader = new BatchLoader();
-        const behavioralMap = await loader.loadBehavioralProfiles(allCandidates);
-
         const clusters: RawCluster[] = [];
         for (const [, members] of buckets) {
             if (members.length < MIN_FAMILY_SIZE) continue;
-
-            // Sub-cluster within the bucket by behavioral fingerprint. Members
-            // without profiles share a dedicated "unknown" bucket — they pair
-            // only with each other, never with profiled members.
-            const subBuckets = new Map<string, string[]>();
-            for (const svId of members) {
-                const bp = behavioralMap.get(svId);
-                const fingerprint = this.behavioralFingerprint(bp);
-                const existing = subBuckets.get(fingerprint) || [];
-                existing.push(svId);
-                subBuckets.set(fingerprint, existing);
-            }
-
-            for (const [, subMembers] of subBuckets) {
-                if (subMembers.length < MIN_FAMILY_SIZE) continue;
-                // Build synthetic edges between all sub-members
-                const edges: EdgeRecord[] = [];
-                for (let i = 0; i < subMembers.length; i++) {
-                    for (let j = i + 1; j < subMembers.length; j++) {
-                        edges.push({
-                            src: subMembers[i]!, dst: subMembers[j]!,
-                            confidence: 0.45, relation_type: 'naming_pattern',
-                        });
-                    }
+            // Build synthetic edges between all members
+            const edges: EdgeRecord[] = [];
+            for (let i = 0; i < members.length; i++) {
+                for (let j = i + 1; j < members.length; j++) {
+                    edges.push({
+                        src: members[i]!, dst: members[j]!,
+                        confidence: 0.45, relation_type: 'naming_pattern',
+                    });
                 }
-                clusters.push({
-                    member_sv_ids: subMembers,
-                    internal_edges: edges,
-                    avg_confidence: 0.45,
-                });
             }
+            clusters.push({
+                member_sv_ids: members,
+                internal_edges: edges,
+                avg_confidence: 0.45,
+            });
         }
 
         return clusters;
-    }
-
-    /**
-     * Compact behavioral fingerprint used to sub-bucket a naming cluster.
-     * Members sharing a fingerprint have the same purity class AND the
-     * same high-level effect categories (db read/write, network, file,
-     * cache, auth). Bucketing on (purity × effect-set) is strict enough
-     * to separate `queryWithClient` from `lockClient` while still
-     * grouping genuine concept families.
-     */
-    private behavioralFingerprint(bp: BehavioralProfile | undefined): string {
-        if (!bp) return 'unknown';
-        const parts: string[] = [bp.purity_class];
-        if ((bp.db_reads?.length ?? 0) > 0) parts.push('r');
-        if ((bp.db_writes?.length ?? 0) > 0) parts.push('w');
-        if ((bp.network_calls?.length ?? 0) > 0) parts.push('n');
-        if ((bp.file_io?.length ?? 0) > 0) parts.push('f');
-        if ((bp.cache_ops?.length ?? 0) > 0) parts.push('c');
-        if ((bp.auth_operations?.length ?? 0) > 0) parts.push('a');
-        if ((bp.transaction_profile?.length ?? 0) > 0) parts.push('t');
-        return parts.join('|');
     }
 
     /**

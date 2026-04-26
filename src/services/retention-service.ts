@@ -198,46 +198,37 @@ export async function cleanupOrphanedData(): Promise<number> {
     const timer = log.startTimer('cleanupOrphanedData');
     let totalCleaned = 0;
 
-    // Wrap both DELETEs in a transaction for atomicity
-    await db.query('BEGIN');
-    try {
-        // Evidence bundles with no referencing inferred_relations
-        const evidenceResult = await db.query(`
-            DELETE FROM evidence_bundles
-            WHERE evidence_bundle_id NOT IN (
-                SELECT DISTINCT evidence_bundle_id
-                FROM inferred_relations
-                WHERE evidence_bundle_id IS NOT NULL
-            )
-            AND generated_at < NOW() - INTERVAL '1 hour'
-        `);
-        const evidenceCleaned = evidenceResult.rowCount ?? 0;
-        totalCleaned += evidenceCleaned;
+    // Evidence bundles with no referencing inferred_relations
+    const evidenceResult = await db.query(`
+        DELETE FROM evidence_bundles
+        WHERE evidence_bundle_id NOT IN (
+            SELECT DISTINCT evidence_bundle_id
+            FROM inferred_relations
+            WHERE evidence_bundle_id IS NOT NULL
+        )
+        AND generated_at < NOW() - INTERVAL '1 hour'
+    `);
+    const evidenceCleaned = evidenceResult.rowCount ?? 0;
+    totalCleaned += evidenceCleaned;
 
-        // Transaction file backups for terminal transactions older than 24 hours
-        const backupResult = await db.query(`
-            DELETE FROM transaction_file_backups
-            WHERE txn_id IN (
-                SELECT txn_id FROM change_transactions
-                WHERE state IN ('committed', 'rolled_back', 'failed')
-                  AND updated_at < NOW() - INTERVAL '24 hours'
-            )
-        `);
-        const backupsCleaned = backupResult.rowCount ?? 0;
-        totalCleaned += backupsCleaned;
+    // Transaction file backups for terminal transactions older than 24 hours
+    const backupResult = await db.query(`
+        DELETE FROM transaction_file_backups
+        WHERE txn_id IN (
+            SELECT txn_id FROM change_transactions
+            WHERE state IN ('committed', 'rolled_back', 'failed')
+              AND updated_at < NOW() - INTERVAL '24 hours'
+        )
+    `);
+    const backupsCleaned = backupResult.rowCount ?? 0;
+    totalCleaned += backupsCleaned;
 
-        await db.query('COMMIT');
-
-        if (totalCleaned > 0) {
-            await logCleanup('orphan_data_cleanup', 'multiple', totalCleaned, {
-                evidence_bundles: evidenceCleaned,
-                transaction_file_backups: backupsCleaned,
-            });
-            timer({ cleaned: totalCleaned, evidence_bundles: evidenceCleaned, backups: backupsCleaned });
-        }
-    } catch (err) {
-        await db.query('ROLLBACK').catch(() => {});
-        throw err;
+    if (totalCleaned > 0) {
+        await logCleanup('orphan_data_cleanup', 'multiple', totalCleaned, {
+            evidence_bundles: evidenceCleaned,
+            transaction_file_backups: backupsCleaned,
+        });
+        timer({ cleaned: totalCleaned, evidence_bundles: evidenceCleaned, backups: backupsCleaned });
     }
 
     return totalCleaned;
@@ -252,103 +243,88 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
     const start = Date.now();
     const errors: string[] = [];
 
-    // Use a dedicated client for the advisory lock to ensure lock and unlock
-    // execute on the same connection. Session-level advisory locks are bound
-    // to the connection, not the session — using the pool directly would risk
-    // lock/unlock on different connections (silent leak).
-    const lockClient = await (db as any).pool.connect();
+    // Try to acquire advisory lock (non-blocking)
+    const lockResult = await db.query(
+        `SELECT pg_try_advisory_lock($1) AS acquired`,
+        [RETENTION_LOCK_ID],
+    );
+    const acquired = (lockResult.rows[0] as { acquired: boolean })?.acquired;
+    if (!acquired) {
+        log.info('Retention policy already running — skipping');
+        return {
+            snapshotsExpired: 0,
+            snapshotsCapped: 0,
+            staleTransactionsCleaned: 0,
+            orphansCleaned: 0,
+            durationMs: Date.now() - start,
+            errors: ['Lock not acquired — concurrent retention run in progress'],
+        };
+    }
+
+    let snapshotsExpired = 0;
+    let snapshotsCapped = 0;
+    let staleTransactionsCleaned = 0;
+    let orphansCleaned = 0;
 
     try {
-        const lockResult = await lockClient.query(
-            `SELECT pg_try_advisory_lock($1) AS acquired`,
-            [RETENTION_LOCK_ID],
-        );
-        const acquired = lockResult.rows[0]?.acquired;
-        if (!acquired) {
-            // Don't release here — outer finally handles it
-            log.info('Retention policy already running — skipping');
-            return {
-                snapshotsExpired: 0,
-                snapshotsCapped: 0,
-                staleTransactionsCleaned: 0,
-                orphansCleaned: 0,
-                durationMs: Date.now() - start,
-                errors: ['Lock not acquired — concurrent retention run in progress'],
-            };
-        }
-
-        let snapshotsExpired = 0;
-        let snapshotsCapped = 0;
-        let staleTransactionsCleaned = 0;
-        let orphansCleaned = 0;
-
+        // Phase 1: Stale transactions (fast, high priority)
         try {
-            // Phase 1: Stale transactions (fast, high priority)
-            try {
-                staleTransactionsCleaned = await cleanupStaleTransactions();
-            } catch (err) {
-                const wrapped = err instanceof Error ? err : new Error(String(err));
-                log.error('Retention: stale transaction cleanup failed', wrapped);
-                errors.push(`stale_transactions: ${wrapped.message}`);
-            }
-
-            // Phase 2: Snapshot expiry
-            try {
-                snapshotsExpired = await cleanupExpiredSnapshots();
-            } catch (err) {
-                const wrapped = err instanceof Error ? err : new Error(String(err));
-                log.error('Retention: snapshot expiry failed', wrapped);
-                errors.push(`snapshot_expiry: ${wrapped.message}`);
-            }
-
-            // Phase 3: Snapshot cap enforcement
-            try {
-                snapshotsCapped = await enforceSnapshotCap();
-            } catch (err) {
-                const wrapped = err instanceof Error ? err : new Error(String(err));
-                log.error('Retention: snapshot cap enforcement failed', wrapped);
-                errors.push(`snapshot_cap: ${wrapped.message}`);
-            }
-
-            // Phase 4: Orphan cleanup
-            try {
-                orphansCleaned = await cleanupOrphanedData();
-            } catch (err) {
-                const wrapped = err instanceof Error ? err : new Error(String(err));
-                log.error('Retention: orphan cleanup failed', wrapped);
-                errors.push(`orphan_cleanup: ${wrapped.message}`);
-            }
-        } finally {
-            // Unlock on the SAME client that acquired the lock
-            try {
-                await lockClient.query(`SELECT pg_advisory_unlock($1)`, [RETENTION_LOCK_ID]);
-            } catch (unlockErr) {
-                log.error('Failed to release retention advisory lock', unlockErr instanceof Error ? unlockErr : new Error(String(unlockErr)));
-            }
+            staleTransactionsCleaned = await cleanupStaleTransactions();
+        } catch (err) {
+            const wrapped = err instanceof Error ? err : new Error(String(err));
+            log.error('Retention: stale transaction cleanup failed', wrapped);
+            errors.push(`stale_transactions: ${wrapped.message}`);
         }
 
-        const durationMs = Date.now() - start;
+        // Phase 2: Snapshot expiry
+        try {
+            snapshotsExpired = await cleanupExpiredSnapshots();
+        } catch (err) {
+            const wrapped = err instanceof Error ? err : new Error(String(err));
+            log.error('Retention: snapshot expiry failed', wrapped);
+            errors.push(`snapshot_expiry: ${wrapped.message}`);
+        }
 
-        log.info('Retention policy completed', {
-            snapshotsExpired,
-            snapshotsCapped,
-            staleTransactionsCleaned,
-            orphansCleaned,
-            durationMs,
-            errorCount: errors.length,
-        });
+        // Phase 3: Snapshot cap enforcement
+        try {
+            snapshotsCapped = await enforceSnapshotCap();
+        } catch (err) {
+            const wrapped = err instanceof Error ? err : new Error(String(err));
+            log.error('Retention: snapshot cap enforcement failed', wrapped);
+            errors.push(`snapshot_cap: ${wrapped.message}`);
+        }
 
-        return {
-            snapshotsExpired,
-            snapshotsCapped,
-            staleTransactionsCleaned,
-            orphansCleaned,
-            durationMs,
-            errors,
-        };
+        // Phase 4: Orphan cleanup
+        try {
+            orphansCleaned = await cleanupOrphanedData();
+        } catch (err) {
+            const wrapped = err instanceof Error ? err : new Error(String(err));
+            log.error('Retention: orphan cleanup failed', wrapped);
+            errors.push(`orphan_cleanup: ${wrapped.message}`);
+        }
     } finally {
-        lockClient.release();
+        await db.query(`SELECT pg_advisory_unlock($1)`, [RETENTION_LOCK_ID]);
     }
+
+    const durationMs = Date.now() - start;
+
+    log.info('Retention policy completed', {
+        snapshotsExpired,
+        snapshotsCapped,
+        staleTransactionsCleaned,
+        orphansCleaned,
+        durationMs,
+        errorCount: errors.length,
+    });
+
+    return {
+        snapshotsExpired,
+        snapshotsCapped,
+        staleTransactionsCleaned,
+        orphansCleaned,
+        durationMs,
+        errors,
+    };
 }
 
 /**

@@ -740,9 +740,6 @@ export class Ingestor {
         language: string
     ): Promise<{ symbols: number; relations: number; behaviorHints: number; contractHints: number }> {
 
-        // Accumulate symbol version INSERT statements for batching
-        const svInsertStatements: { text: string; params: unknown[] }[] = [];
-
         // File content cache — read each source file at most once for body_source extraction.
         // Keyed by absolute path to avoid symlink/aliasing cache misses.
         const fileContentCache = new Map<string, string[] | null>();
@@ -785,16 +782,34 @@ export class Ingestor {
             hint.symbol_key = normalizeKey(hint.symbol_key);
         }
 
-        // Phase 1: Merge symbols and batch insert.
-        // Track symbolId→svEntry to deduplicate: if two extracted symbols
-        // share the same (symbol_id, snapshot_id), the ON CONFLICT DO UPDATE
-        // keeps the original symbol_version_id. We must use the DB's actual
-        // symbol_version_id in Phase 3, not the generated svId.
-        const symbolIdToEntry = new Map<string, { svId: string; sym: ExtractedSymbol; symbolId: string }>();
+        // Phase 1a: Pre-load all files for this snapshot once.
+        // Replaces the per-symbol "SELECT file_id FROM files WHERE …" round-trip
+        // (~7.5k queries on this repo's first ingest).
+        const fileResultAll = await db.query(
+            `SELECT file_id, path FROM files WHERE snapshot_id = $1`,
+            [snapshotId],
+        );
+        const fileIdByPath = new Map<string, string>();
+        for (const row of fileResultAll.rows as { file_id: string; path: string }[]) {
+            fileIdByPath.set(row.path, row.file_id);
+        }
 
+        // Phase 1b: Walk extracted symbols once to:
+        //   - normalise absolute → relative stable_key paths (in place)
+        //   - collect distinct stable_keys for bulk symbol merge
+        //   - build a per-symbol shadow record so Phase 2 doesn't re-scan
+        interface ShadowEntry {
+            sym: ExtractedSymbol;
+            stableKeyPath: string;
+        }
+        const shadowEntries: ShadowEntry[] = [];
+        const distinctSymInputs = new Map<string, {
+            stable_key: string;
+            canonical_name: string;
+            kind: string;
+        }>();
         for (const sym of extraction.symbols) {
             // Stable key format: "filePath::SymbolName" or "filePath#SymbolName"
-            // Support both separators for cross-adapter compatibility
             let separatorIdx = sym.stable_key.indexOf('::');
             if (separatorIdx < 0) separatorIdx = sym.stable_key.indexOf('#');
             let stableKeyPath = separatorIdx >= 0 ? sym.stable_key.substring(0, separatorIdx) : sym.stable_key;
@@ -804,23 +819,79 @@ export class Ingestor {
                     ? stableKeyPath + sym.stable_key.substring(separatorIdx)
                     : stableKeyPath;
             }
-
-            const symbolId = await coreDataService.mergeSymbol({
-                repo_id: repoId,
+            shadowEntries.push({ sym, stableKeyPath });
+            distinctSymInputs.set(sym.stable_key, {
                 stable_key: sym.stable_key,
                 canonical_name: sym.canonical_name,
                 kind: sym.kind,
             });
+        }
 
-            const relativePath = stableKeyPath;
-            const fileResult = await db.query(
-                `SELECT file_id FROM files WHERE snapshot_id = $1 AND path = $2`,
-                [snapshotId, relativePath]
-            );
-            const fileId = optionalStringField(firstRow(fileResult), 'file_id');
+        // Phase 1c: Bulk-merge symbols (was N round-trips of mergeSymbol).
+        // Single multi-row INSERT … ON CONFLICT (repo_id, stable_key) DO UPDATE
+        // … RETURNING. ON CONFLICT DO UPDATE returns one row per input — this
+        // is critical for the lookup map below.
+        const symbolIdByStableKey = new Map<string, string>();
+        if (distinctSymInputs.size > 0) {
+            const SYM_COLS = 6; // symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace
+            const MAX_PARAMS = 30_000;
+            const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / SYM_COLS));
+            const allRows = Array.from(distinctSymInputs.values()).map(s => [
+                crypto.randomUUID(),
+                repoId,
+                s.stable_key,
+                s.canonical_name,
+                s.kind,
+                null,
+            ]);
+            for (let offset = 0; offset < allRows.length; offset += maxRowsPerChunk) {
+                const chunk = allRows.slice(offset, offset + maxRowsPerChunk);
+                const valuesClauses: string[] = [];
+                const params: unknown[] = [];
+                let idx = 1;
+                for (const r of chunk) {
+                    valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5})`);
+                    params.push(...r);
+                    idx += SYM_COLS;
+                }
+                const mergeResult = await db.query(
+                    `INSERT INTO symbols (symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace)
+                     VALUES ${valuesClauses.join(', ')}
+                     ON CONFLICT (repo_id, stable_key) DO UPDATE SET
+                         canonical_name = EXCLUDED.canonical_name,
+                         kind = EXCLUDED.kind
+                     RETURNING symbol_id, stable_key`,
+                    params,
+                );
+                for (const row of mergeResult.rows as { symbol_id: string; stable_key: string }[]) {
+                    symbolIdByStableKey.set(row.stable_key, row.symbol_id);
+                }
+            }
+        }
+
+        // Phase 2: Build symbol_version rows from shadow entries + the file/symbol maps.
+        // Track symbolId→svEntry to deduplicate: if two extracted symbols share
+        // the same (symbol_id, snapshot_id), the ON CONFLICT DO UPDATE keeps the
+        // original symbol_version_id. We must use the DB's actual symbol_version_id
+        // in Phase 3, not the generated svId.
+        const symbolIdToEntry = new Map<string, { svId: string; sym: ExtractedSymbol; symbolId: string }>();
+        // Map<symbol_id → row> so we keep the last extracted row per symbol_id
+        // (matches the previous "ON CONFLICT DO UPDATE" semantics) and avoid
+        // O(N²) dedupe. Dedupe must happen here because PostgreSQL refuses
+        // ON CONFLICT DO UPDATE on the same target row twice in one statement.
+        const rowBySymbolId = new Map<string, unknown[]>();
+        const filteredUncertaintyFlags = (extraction.uncertainty_flags || []).filter(f =>
+            f === 'encoding_fallback' || f === 'extraction_error',
+        );
+
+        for (const { sym, stableKeyPath } of shadowEntries) {
+            const symbolId = symbolIdByStableKey.get(sym.stable_key);
+            if (!symbolId) continue;
+
+            const fileId = fileIdByPath.get(stableKeyPath);
             if (!fileId) continue;
 
-            // Extract body source from file using line ranges
+            // Extract body source from file using line ranges (uses per-file cache)
             const lines = await getFileLines(stableKeyPath);
             let bodySource: string | null = null;
             if (lines && sym.range_start_line >= 1 && sym.range_end_line >= sym.range_start_line) {
@@ -833,55 +904,67 @@ export class Ingestor {
             }
 
             const svId = crypto.randomUUID();
-            svInsertStatements.push({
-                text: `
-                    INSERT INTO symbol_versions (
-                        symbol_version_id, symbol_id, snapshot_id, file_id,
-                        range_start_line, range_start_col, range_end_line, range_end_col,
-                        signature, ast_hash, body_hash, normalized_ast_hash,
-                        summary, body_source, visibility, language, uncertainty_flags
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                    ON CONFLICT (symbol_id, snapshot_id) DO UPDATE SET
-                        file_id = EXCLUDED.file_id,
-                        range_start_line = EXCLUDED.range_start_line,
-                        range_start_col = EXCLUDED.range_start_col,
-                        range_end_line = EXCLUDED.range_end_line,
-                        range_end_col = EXCLUDED.range_end_col,
-                        signature = EXCLUDED.signature,
-                        ast_hash = EXCLUDED.ast_hash,
-                        body_hash = EXCLUDED.body_hash,
-                        normalized_ast_hash = EXCLUDED.normalized_ast_hash,
-                        summary = EXCLUDED.summary,
-                        body_source = EXCLUDED.body_source,
-                        visibility = EXCLUDED.visibility,
-                        language = EXCLUDED.language,
-                        uncertainty_flags = EXCLUDED.uncertainty_flags
-                `,
-                params: [
-                    svId, symbolId, snapshotId, fileId,
-                    sym.range_start_line, sym.range_start_col, sym.range_end_line, sym.range_end_col,
-                    sym.signature, sym.ast_hash, sym.body_hash, sym.normalized_ast_hash || null,
-                    sym.summary || '', bodySource, sym.visibility, language,
-                    // Only propagate extraction-wide uncertainty flags that genuinely
-                    // apply to every symbol.  `parse_error` is NOT safe to broadcast:
-                    // the TS adapter accumulates flags across an entire multi-file batch,
-                    // so a single missing file would tag every symbol in the repo with
-                    // parse_error — causing massive false-positive uncertainty annotations
-                    // (e.g. 3,867 / 3,904 symbols flagged when ingestion fully succeeded).
-                    // `encoding_fallback` and `extraction_error` are true file-level flags
-                    // set by the universal adapter (called per-file), so they are safe.
-                    (extraction.uncertainty_flags || []).filter(f =>
-                        f === 'encoding_fallback' || f === 'extraction_error'
-                    )
-                ],
-            });
-            // Deduplicate: keep the last entry per symbolId (matches ON CONFLICT DO UPDATE behavior)
+            // Order MUST match the column list in the bulk INSERT below.
+            //
+            // uncertainty_flags rationale: only propagate extraction-wide flags
+            // that apply per-symbol. `parse_error` accumulates across multi-file
+            // batches in the TS adapter, so broadcasting it would tag every symbol
+            // when one file fails (3867/3904 false positives observed in regression).
+            // `encoding_fallback` and `extraction_error` are file-level and safe.
+            rowBySymbolId.set(symbolId, [
+                svId, symbolId, snapshotId, fileId,
+                sym.range_start_line, sym.range_start_col, sym.range_end_line, sym.range_end_col,
+                sym.signature, sym.ast_hash, sym.body_hash, sym.normalized_ast_hash || null,
+                sym.summary || '', bodySource, sym.visibility, language,
+                filteredUncertaintyFlags,
+            ]);
             symbolIdToEntry.set(symbolId, { svId, sym, symbolId });
         }
 
-        // Phase 2: Batch insert all symbol versions in a single transaction
-        if (svInsertStatements.length > 0) {
-            await db.batchInsert(svInsertStatements);
+        // Phase 2.0: Bulk insert symbol_versions in chunked multi-row INSERTs.
+        // Replaces the previous N-statement batchInsert path.
+        const dedupedRows = Array.from(rowBySymbolId.values());
+        if (dedupedRows.length > 0) {
+            const SV_COLS = 17;
+            const MAX_PARAMS = 30_000;
+            const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / SV_COLS));
+            await db.transaction(async (client) => {
+                for (let offset = 0; offset < dedupedRows.length; offset += maxRowsPerChunk) {
+                    const chunk = dedupedRows.slice(offset, offset + maxRowsPerChunk);
+                    const valuesClauses: string[] = [];
+                    const params: unknown[] = [];
+                    let idx = 1;
+                    for (const r of chunk) {
+                        const placeholders = Array.from({ length: SV_COLS }, () => `$${idx++}`);
+                        valuesClauses.push(`(${placeholders.join(', ')})`);
+                        params.push(...r);
+                    }
+                    await client.query(
+                        `INSERT INTO symbol_versions (
+                            symbol_version_id, symbol_id, snapshot_id, file_id,
+                            range_start_line, range_start_col, range_end_line, range_end_col,
+                            signature, ast_hash, body_hash, normalized_ast_hash,
+                            summary, body_source, visibility, language, uncertainty_flags
+                        ) VALUES ${valuesClauses.join(', ')}
+                        ON CONFLICT (symbol_id, snapshot_id) DO UPDATE SET
+                            file_id = EXCLUDED.file_id,
+                            range_start_line = EXCLUDED.range_start_line,
+                            range_start_col = EXCLUDED.range_start_col,
+                            range_end_line = EXCLUDED.range_end_line,
+                            range_end_col = EXCLUDED.range_end_col,
+                            signature = EXCLUDED.signature,
+                            ast_hash = EXCLUDED.ast_hash,
+                            body_hash = EXCLUDED.body_hash,
+                            normalized_ast_hash = EXCLUDED.normalized_ast_hash,
+                            summary = EXCLUDED.summary,
+                            body_source = EXCLUDED.body_source,
+                            visibility = EXCLUDED.visibility,
+                            language = EXCLUDED.language,
+                            uncertainty_flags = EXCLUDED.uncertainty_flags`,
+                        params,
+                    );
+                }
+            });
         }
 
         // Phase 2.5: Batch resolve actual symbol_version_ids from the DB.
@@ -1057,6 +1140,18 @@ export class Ingestor {
                 );
             }
 
+            // Tables keyed directly on snapshot_id (FK ON DELETE CASCADE points at
+            // snapshots, but we intentionally keep the snapshot row, so CASCADE
+            // doesn't fire here). Without these explicit deletes, partial/failed
+            // ingests leave orphans that re-accumulate on every retry.
+            await db.queryWithClient(client, 'DELETE FROM idf_corpus WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM dispatch_edges WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM class_hierarchy WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM concept_families WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM temporal_risk_scores WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM runtime_traces WHERE snapshot_id = $1', [snapshotId]);
+            await db.queryWithClient(client, 'DELETE FROM capsule_compilations WHERE snapshot_id = $1', [snapshotId]);
+
             await db.queryWithClient(client,
                 'DELETE FROM files WHERE snapshot_id = $1',
                 [snapshotId]
@@ -1120,9 +1215,21 @@ export class Ingestor {
             // Body-scanning fallback: scan test body for non-test symbol names.
             // This catches symbols referenced in mock setups, string imports, and
             // describe/it block names that the adapter didn't extract as relations.
+            //
+            // Tokenize body once (O(L)) into an identifier set, then probe nameToSvId
+            // by lookup. Replaces the previous O(testCount × nameCount × L) loop of
+            // string.includes() — for ingest of this repo, that pattern was the
+            // dominant cost (~50M includes() calls).
             if (testSv.body_source) {
-                for (const [name, svId] of nameToSvId) {
-                    if (!relatedSet.has(svId) && testSv.body_source.includes(name)) {
+                const tokens = new Set<string>();
+                const tokenRe = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+                let match: RegExpExecArray | null;
+                while ((match = tokenRe.exec(testSv.body_source)) !== null) {
+                    if (match[0].length >= 3) tokens.add(match[0]);
+                }
+                for (const token of tokens) {
+                    const svId = nameToSvId.get(token);
+                    if (svId && !relatedSet.has(svId)) {
                         relatedSet.add(svId);
                     }
                 }

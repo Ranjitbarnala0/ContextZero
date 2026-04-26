@@ -292,17 +292,10 @@ export class SymbolLineageEngine {
                         })(),
                     });
 
-                    // Link symbol to new lineage.
-                    // NOTE: we look up the lineage_id by (repo_id, identity_seed) rather
-                    // than trusting newLineageId — the INSERT above uses ON CONFLICT DO UPDATE,
-                    // which keeps the PRE-EXISTING lineage_id when a row for this seed is
-                    // already present (left over from a prior ingestion of the same repo).
+                    // Link symbol to new lineage
                     linkStatements.push({
-                        text: `UPDATE symbols SET lineage_id = (
-                                   SELECT lineage_id FROM symbol_lineage
-                                   WHERE repo_id = $1 AND identity_seed = $2
-                               ) WHERE symbol_id = $3`,
-                        params: [repoId, rename.new_identity_seed, rename.new_symbol_id],
+                        text: `UPDATE symbols SET lineage_id = $1 WHERE symbol_id = $2`,
+                        params: [newLineageId, rename.new_symbol_id],
                     });
 
                     renamesDetected++;
@@ -336,15 +329,9 @@ export class SymbolLineageEngine {
                 ],
             });
 
-            // Look up lineage_id by identity_seed — see note in the rename block above.
-            // ON CONFLICT DO UPDATE keeps the pre-existing lineage_id if one was already
-            // present for this (repo_id, identity_seed) pair.
             linkStatements.push({
-                text: `UPDATE symbols SET lineage_id = (
-                           SELECT lineage_id FROM symbol_lineage
-                           WHERE repo_id = $1 AND identity_seed = $2
-                       ) WHERE symbol_id = $3`,
-                params: [repoId, seed, symbolId],
+                text: `UPDATE symbols SET lineage_id = $1 WHERE symbol_id = $2`,
+                params: [lineageId, symbolId],
             });
 
             births++;

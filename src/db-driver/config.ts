@@ -131,19 +131,6 @@ const LOCALHOST_HOSTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A host is "local" if it is loopback, OR is a Unix domain socket path
- * (node-postgres treats DB_HOST values that start with "/" as socket directories).
- * Unix sockets cannot carry TLS and are inherently local, so SSL is neither
- * possible nor required.
- */
-function isLocalHost(host: string): boolean {
-    if (LOCALHOST_HOSTS.has(host)) return true;
-    // Unix domain socket directory (e.g. /var/run/postgresql, /tmp).
-    if (host.startsWith('/')) return true;
-    return false;
-}
-
-/**
  * Build the SSL/TLS configuration object based on environment variables.
  *
  * Environment variables consumed:
@@ -169,7 +156,7 @@ function buildSslConfig(host: string): false | tls.ConnectionOptions {
         });
     }
 
-    const isRemoteHost = !isLocalHost(host);
+    const isRemoteHost = !LOCALHOST_HOSTS.has(host);
 
     // --- Production safety checks ---------------------------------------------------
     if (isProduction()) {
@@ -178,6 +165,15 @@ function buildSslConfig(host: string): false | tls.ConnectionOptions {
                 'Refusing to connect to a remote database without SSL in production. ' +
                 `DB_HOST="${host}" is not localhost. ` +
                 'Set DB_SSL_MODE to "require", "verify-ca", or "verify-full".'
+            );
+        }
+        if (mode === 'require' && isRemoteHost) {
+            throw new Error(
+                'Refusing to connect to a remote database with DB_SSL_MODE="require" in production. ' +
+                `DB_HOST="${host}" is not localhost. ` +
+                '"require" encrypts traffic but does NOT validate the server certificate, ' +
+                'leaving the connection open to active MITM attacks. ' +
+                'Set DB_SSL_MODE to "verify-ca" or "verify-full" and provide DB_SSL_CA.'
             );
         }
         if (mode === 'disable') {

@@ -24,6 +24,8 @@ export interface SearchMatch {
 
 export interface SearchCodeResult {
     pattern: string;
+    /** 'regex' = pattern compiled as regex; 'literal' = fell back to escaped literal search (e.g. ReDoS-suspect input). */
+    mode: 'regex' | 'literal';
     total_matches: number;
     matches: SearchMatch[];
 }
@@ -49,11 +51,14 @@ interface MinimalLogger {
  */
 const REDOS_SUSPECT = /(\([^)]*[+*][^)]*\))[+*]|\(\?[^)]*\|[^)]*\)[+*]/;
 
-function buildSafeRegex(pattern: string, log?: MinimalLogger): RegExp {
+function buildSafeRegex(
+    pattern: string,
+    log?: MinimalLogger,
+): { regex: RegExp; mode: 'regex' | 'literal' } {
     const useRegex = !REDOS_SUSPECT.test(pattern);
     try {
         if (!useRegex) throw new Error('ReDoS-suspect pattern');
-        return new RegExp(pattern, 'gi');
+        return { regex: new RegExp(pattern, 'gi'), mode: 'regex' };
     } catch (error) {
         if (log) {
             log.debug('Falling back to literal search pattern', {
@@ -61,7 +66,10 @@ function buildSafeRegex(pattern: string, log?: MinimalLogger): RegExp {
                 error: error instanceof Error ? error.message : String(error),
             });
         }
-        return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+        return {
+            regex: new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'),
+            mode: 'literal',
+        };
     }
 }
 
@@ -94,7 +102,7 @@ export async function searchCode(
         LIMIT 10000
     `, [repoId]);
 
-    const regex = buildSafeRegex(pattern, log);
+    const { regex, mode: searchMode } = buildSafeRegex(pattern, log);
 
     const matches: SearchMatch[] = [];
 
@@ -127,7 +135,6 @@ export async function searchCode(
     for (let batchStart = 0; batchStart < files.length && matches.length < maxResults; batchStart += BATCH_SIZE) {
         const batchEnd = Math.min(batchStart + BATCH_SIZE, files.length);
         const batch = files.slice(batchStart, batchEnd);
-        const remaining = maxResults - matches.length;
 
         const batchResults = await Promise.allSettled(
             batch.map(async (filePath) => {
@@ -185,6 +192,7 @@ export async function searchCode(
 
     return {
         pattern,
+        mode: searchMode,
         total_matches: matches.length,
         matches,
     };

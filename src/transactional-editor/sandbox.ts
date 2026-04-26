@@ -241,19 +241,12 @@ export async function sandboxExec(
         let spawnArgs = args;
 
         if (process.platform === 'linux') {
-            // Each ulimit is wrapped in a subshell that silently ignores failures.
-            // Some systems restrict certain ulimit flags (e.g., -u requires
-            // appropriate privileges, -v may not be supported on all kernels).
-            // Using `(ulimit ... 2>/dev/null || true)` ensures the sandbox
-            // starts even when specific limits can't be applied.
-            const safeUlimit = (flag: string, value: number) =>
-                `(ulimit ${flag} ${Math.floor(value)} 2>/dev/null || true)`;
             const ulimitPrefix = [
-                safeUlimit('-v', limits.maxMemoryMb * 1024),    // virtual memory in KB
-                safeUlimit('-t', limits.maxCpuSeconds),          // CPU time in seconds
-                safeUlimit('-u', limits.maxProcesses),           // max user processes
-                safeUlimit('-f', limits.maxFileSizeMb * 1024),   // file size in KB
-                safeUlimit('-n', limits.maxOpenFiles),           // open file descriptors
+                `ulimit -v ${Math.floor(limits.maxMemoryMb * 1024)}`,    // virtual memory in KB
+                `ulimit -t ${Math.floor(limits.maxCpuSeconds)}`,          // CPU time in seconds
+                `ulimit -u ${Math.floor(limits.maxProcesses)}`,           // max user processes
+                `ulimit -f ${Math.floor(limits.maxFileSizeMb * 1024)}`,   // file size in KB
+                `ulimit -n ${Math.floor(limits.maxOpenFiles)}`,           // open file descriptors
             ].join(' && ');
 
             // Wrap: sh -c "ulimit ... && exec <original command>"
@@ -267,15 +260,29 @@ export async function sandboxExec(
             // -r  = map current user to root inside namespace (avoids EPERM)
             // --pid --fork = new PID namespace, fork so child becomes PID 1
             // --mount-proc = mount a private /proc showing only the namespace
-            // Falls back to bare execution if unshare fails at runtime.
+            //
+            // In dev/test we keep a fallback to bare execution if unshare fails
+            // at runtime (kernel feature disabled on the host). In production
+            // this fallback is dropped: a runtime unshare failure must surface
+            // as a non-zero exit code so we don't silently degrade isolation
+            // (which would let a sandboxed child read /proc/<parent>/environ
+            // for DB_PASSWORD, SCG_API_KEYS, etc.).
             const innerCmd = `${ulimitPrefix} && exec ${escapedCommand} ${escapedArgs}`;
+            const isProduction = (process.env['NODE_ENV'] || '').toLowerCase() === 'production';
             if (isUnshareAvailable()) {
                 spawnCommand = '/bin/sh';
-                spawnArgs = [
-                    '-c',
-                    `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)} 2>/dev/null || ` +
-                    `/bin/sh -c ${escapeShell(innerCmd)}`,
-                ];
+                if (isProduction) {
+                    spawnArgs = [
+                        '-c',
+                        `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)}`,
+                    ];
+                } else {
+                    spawnArgs = [
+                        '-c',
+                        `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)} 2>/dev/null || ` +
+                        `/bin/sh -c ${escapeShell(innerCmd)}`,
+                    ];
+                }
             } else {
                 spawnCommand = '/bin/sh';
                 spawnArgs = ['-c', innerCmd];
